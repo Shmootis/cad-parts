@@ -130,6 +130,50 @@ def main() -> int:
         code, v = call("GET", "/api/version")
         check(code == 200 and v.get("version") == server.APP_VERSION, "version info")
 
+        # --- your Claude account owns this folder; a new PC finds it after signing in
+        server._account["id"] = "test-account"
+        server.stamp_owner(root, "Tester")
+        check(server.read_owner(root) == {"name": "Tester", "account": "test-account"}, "folder remembers its owner")
+        server.sync_roots = lambda: [tmp]
+        server._found_cache["t"] = 0
+        m = server.find_my_folder()
+        check(m and Path(m["folder"]) == root and m["name"] == "Tester", "a new PC finds the owner's folder", m)
+        server._account["id"] = "someone-else"
+        server._found_cache["t"] = 0
+        check(server.find_my_folder() is None, "someone else's folder isn't picked up")
+        server.stamp_owner(root, "Intruder")
+        check(server.read_owner(root)["name"] == "Tester", "another account doesn't take over the folder")
+        server._account["id"] = "test-account"
+
+        # --- Export My Parts, then import it on "another PC"
+        zip_path = tmp / "export.zip"
+        r = call("POST", "/api/export?dest=" + urllib.request.quote(str(zip_path)))[1]
+        job = {}
+        for _ in range(60):
+            job = call("GET", "/api/job?what=export")[1]
+            if job.get("state") in ("done", "failed"):
+                break
+            time.sleep(0.25)
+        check(r.get("ok") and job.get("state") == "done" and zip_path.is_file(), "export makes one file", job)
+        peek = call("GET", "/api/import/peek?file=" + urllib.request.quote(str(zip_path)))[1]
+        check(peek.get("ok") and peek.get("parts") == 3, "the file says what's in it", peek)
+        other = tmp / "other-pc"
+        (other / "hook").mkdir(parents=True)  # the other PC already has a "hook": it must be left alone
+        res = server.import_parts(str(zip_path), other)
+        check((other / "block" / "block_v1.stl").read_bytes() == STL and res["skipped"] == ["hook"]
+              and not any((other / "hook").iterdir()), "import brings parts over, leaves existing ones alone", res)
+        check(json.loads((other / server.META / "state.json").read_text())["favorites"], "favorites come along")
+        check(server.read_owner(other).get("account") == "test-account", "the owner comes along")
+        old = (root / "block" / "block_v1.stl").stat().st_mtime
+        check(abs((other / "block" / "block_v1.stl").stat().st_mtime - old) < 3, "file dates are kept (date sort)")
+        evil = tmp / "evil.zip"
+        import zipfile
+        with zipfile.ZipFile(evil, "w") as z:
+            z.writestr(server.EXPORT_MANIFEST, "{}")
+            z.writestr("../escaped.txt", "x")
+        server.import_parts(str(evil), tmp / "evil-target")
+        check(not (tmp / "escaped.txt").exists(), "a file can't write outside the folder")
+
         # --- the installer's /api/quit (no Origin, no key) still stops the server
         check(call("POST", "/api/quit", token=False)[0] == 200, "quit works for the installer")
     finally:

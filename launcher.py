@@ -106,6 +106,26 @@ class Api:
         r = self._win.create_file_dialog(kind, directory=start)
         return r[0] if r else None
 
+    def save_file(self, name=""):
+        """Where to save an Export My Parts file (Downloads first)."""
+        import webview
+        if not self._win:
+            return None
+        kind = webview.FileDialog.SAVE if hasattr(webview, "FileDialog") else webview.SAVE_DIALOG
+        r = self._win.create_file_dialog(kind, directory=str(Path.home() / "Downloads"), save_filename=name,
+                                         file_types=("CAD Parts file (*.zip)",))
+        p = r if isinstance(r, str) else (r[0] if r else None)
+        return None if not p else (p if p.lower().endswith(".zip") else p + ".zip")
+
+    def open_file(self):
+        """Pick a CAD Parts file to import."""
+        import webview
+        if not self._win:
+            return None
+        kind = webview.FileDialog.OPEN if hasattr(webview, "FileDialog") else webview.OPEN_DIALOG
+        r = self._win.create_file_dialog(kind, directory=str(Path.home() / "Downloads"), file_types=("CAD Parts file (*.zip)",))
+        return r[0] if r else None
+
 
 def focus_existing():
     """Second launch: bring the open window to the front instead of opening another one."""

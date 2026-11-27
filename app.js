@@ -27,6 +27,13 @@ async function pickFolder(start = '') {
   const r = await (await fetch('/api/pickfolder?start=' + encodeURIComponent(start), { method: 'POST' })).json().catch(() => ({}));
   return r.path || '';
 }
+async function pickImportFile() {
+  const api = window.pywebview && window.pywebview.api;
+  if (api && api.open_file) { try { return await api.open_file() || ''; } catch { /* fall back below */ } }
+  toast('Choose the file in the window that opened (it may be behind this one)');
+  const r = await (await fetch('/api/pickfile', { method: 'POST' })).json().catch(() => ({}));
+  return r.path || '';
+}
 const $ = id => document.getElementById(id);
 const GROUPS = [
   { label: 'Today',      max: 86400 },
@@ -1374,6 +1381,22 @@ async function openProfileForm(mode, prof) { // mode: 'first' | 'add' | 'edit'
     : mode === 'add' ? 'A profile has its own parts folder, printers and settings.' : 'Change your name, printers or parts folder. Files are never moved or deleted.';
   $('pfSave').textContent = mode === 'edit' ? 'Save' : mode === 'add' ? 'Add Profile' : 'Get Started';
   $('pfCancel').hidden = mode === 'first';
+  let importFile = '';
+  const showImport = info => {
+    $('pfImportInfo').hidden = $('pfImportClear').hidden = !info; $('pfImportBtn').hidden = !!info;
+    $('pfImportInfo').textContent = info || '';
+  };
+  $('pfImport').hidden = mode === 'edit'; showImport('');
+  $('pfImportBtn').onclick = async () => {
+    const f = await pickImportFile(); if (!f) return;
+    const m = await (await fetch('/api/import/peek?file=' + encodeURIComponent(f))).json().catch(() => ({}));
+    if (!m.ok) { $('pfErr').textContent = m.error || 'That isn\'t a CAD Parts file.'; return; }
+    importFile = f; $('pfErr').textContent = '';
+    showImport(`Importing ${m.parts} part${m.parts === 1 ? '' : 's'}${m.name ? ' from ' + m.name + '\'s file' : ''}`);
+    if (m.name && !$('pfName').value.trim()) $('pfName').value = m.name;
+    if (m.printers.length) { $('pfPrinters').innerHTML = ''; m.printers.forEach(printerRow); fillDefault(m.printer); }
+  };
+  $('pfImportClear').onclick = () => { importFile = ''; showImport(''); };
   $('pfName').value = prof ? prof.name : '';
   $('pfPrinters').innerHTML = '';
   const printers = mode === 'edit' ? (settings.printers || []) : [];
@@ -1390,10 +1413,12 @@ async function openProfileForm(mode, prof) { // mode: 'first' | 'add' | 'edit'
     if (!$('pfName').value.trim()) { $('pfErr').textContent = 'Enter your name.'; $('pfName').focus(); return; }
     if (!pfFolder) { $('pfErr').textContent = 'Choose where your parts should live.'; return; }
     $('pfSave').disabled = true; $('pfErr').textContent = '';
+    const label = $('pfSave').textContent; if (importFile) $('pfSave').textContent = 'Importing…';
     const r = await postJSON('/api/profile/save', { id: mode === 'edit' ? prof.id : null, name: $('pfName').value, folder: pfFolder,
-      printers: formPrinters(), printer: $('pfDefault').value });
-    $('pfSave').disabled = false;
+      printers: formPrinters(), printer: $('pfDefault').value, ...(importFile ? { import: importFile } : {}) });
+    $('pfSave').disabled = false; $('pfSave').textContent = label;
     if (!r.ok) { $('pfErr').textContent = r.error || 'Couldn\'t save.'; return; }
+    if (r.imported && r.imported.skipped.length) sessionStorage.setItem('cad-import-skipped', r.imported.skipped.join(', '));
     location.reload(); // everything (parts, chats, settings) comes from the new folder now
   };
   setTimeout(() => $('pfName').focus(), 0);
@@ -1423,12 +1448,26 @@ if (activeProf && !activeProf.exists) {
   $('lostUse').onclick = () => picked && use(picked);
   await new Promise(() => {}); // the rest of the app starts after the reload
 }
+if (!activeProf) {
+  const found = await (await fetch('/api/profile/find', { cache: 'no-store' })).json().catch(() => ({}));
+  const m = found.match;
+  if (m) {
+    const r = await postJSON('/api/profile/save', { id: null, name: m.name || 'Me', folder: m.folder });
+    if (r.ok) { sessionStorage.setItem('cad-welcome', JSON.stringify(m)); location.reload(); await new Promise(() => {}); }
+  }
+}
 if (!activeProf || !profiles.root) {
   openProfileForm('first', null);
   await new Promise(() => {}); // the rest of the app starts after the reload
 }
 profId = activeProf.id;
 document.body.classList.remove('booting');
+{ // after "Welcome back" (found your folder) or an import that left some parts out
+  const w = sessionStorage.getItem('cad-welcome'); sessionStorage.removeItem('cad-welcome');
+  if (w) { const m = JSON.parse(w); setTimeout(() => toast(`Welcome back${m.name ? ', ' + m.name : ''}: your ${m.parts} part${m.parts === 1 ? ' is' : 's are'} here`), 600); }
+  const sk = sessionStorage.getItem('cad-import-skipped'); sessionStorage.removeItem('cad-import-skipped');
+  if (sk) setTimeout(() => toast('Already in this folder, so not imported: ' + sk), 600);
+}
 draftOpen = localStorage.getItem('cad-draft:' + profId) === '1';
 localStorage.removeItem('cad-draft');
 
@@ -1695,6 +1734,25 @@ async function startUpdate() {
     if (j.state === 'done') return;
   }
 }
+// Move to Another PC: Export My Parts saves everything in one .zip (the app window asks where; otherwise Downloads)
+$('sExport').onclick = async () => {
+  const name = `CAD Parts - ${activeProf.name} - ${new Date().toISOString().slice(0, 10)}.zip`;
+  const api = window.pywebview && window.pywebview.api;
+  let dest = '';
+  if (api && api.save_file) { try { dest = await api.save_file(name) || ''; } catch { dest = ''; } if (!dest) return; }
+  const r = await post('/api/export?' + (dest ? 'dest=' + encodeURIComponent(dest) : 'name=' + encodeURIComponent(name)));
+  if (!r.ok) { toast('Couldn\'t export: ' + (r.error || 'failed')); return; }
+  const b = $('sExport'), info = $('sExportInfo'), was = info.textContent; b.disabled = true;
+  for (;;) {
+    await new Promise(res => setTimeout(res, 400));
+    const j = await (await fetch('/api/job?what=export', { cache: 'no-store' })).json().catch(() => ({}));
+    if (j.state === 'failed') { info.textContent = 'Export failed: ' + (j.error || ''); break; }
+    if (j.state === 'done') { info.textContent = was; toast('Saved ' + j.url); break; }
+    info.textContent = `Packing your parts… ${Math.round((j.pct || 0) * 100)}%`;
+  }
+  b.disabled = false;
+};
+
 // ---------- version + update check (the server asks GitHub for the latest release, at most every 6 hours) ----------
 (async () => {
   let v; try { v = await (await fetch('/api/version', { cache: 'no-store' })).json(); } catch { return; }

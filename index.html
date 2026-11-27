@@ -35,6 +35,7 @@
         <select id="sSlicer"></select></label>
       <div class="setrow"><span>Printers and Parts Folder<small id="sProfInfo"></small></span><button id="sEditProf" type="button">Edit Profile</button></div>
       <div class="setrow"><span>Tools on This PC<small id="sHealthInfo">Claude Code, sign-in, CAD engine, Blender…</small></span><button id="sHealth" type="button">Check Setup</button></div>
+      <div class="setrow"><span>Move to Another PC<small id="sExportInfo">All your parts in one file</small></span><button id="sExport" type="button">Export My Parts</button></div>
       <div class="setrow"><span>CAD Parts Version<small id="sVersion">…</small></span><button id="sUpdate" type="button" class="primary" hidden>Get Update</button></div>
       <label class="setrow"><span>Build Finished Notifications<small>When the app is in the background</small></span><input id="sNotify" type="checkbox"></label>
       <div class="keys"><b>Keyboard Shortcuts</b><div class="kgrid">
@@ -118,6 +119,8 @@
       <path d="M12 2.8 20 7.4v9.2L12 21.2 4 16.6V7.4z"/><path d="M4 7.4 12 12l8-4.6M12 12v9.2" stroke-opacity=".75"/></svg></span>
     <h1 id="setupTitle">Welcome to CAD Parts</h1>
     <p id="setupSub" class="sub">Tell it who you are and where your parts should live. You can change this later.</p>
+    <div id="pfImport" class="pfimport"><button type="button" id="pfImportBtn" class="linkbtn">Have a CAD Parts File? Import It</button>
+      <span id="pfImportInfo" hidden></span><button type="button" id="pfImportClear" class="linkbtn" hidden>Don't Import</button></div>
     <label class="field"><span>Your Name</span><input id="pfName" maxlength="40" placeholder="e.g. Alex"></label>
     <div class="field"><span>Where should your parts be kept?</span><div id="pfFolders" class="folderopts"></div></div>
     <div class="field"><span>Your Printers</span><div id="pfPrinters"></div>

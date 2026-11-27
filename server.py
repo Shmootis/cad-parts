@@ -288,6 +288,15 @@ def worker_up() -> bool:
 
 
 _auth_cache = {"t": 0.0, "v": None}
+_account = {"id": ""}  # fingerprint of the signed-in Claude account's email (see account_id); never sent to the page
+
+
+def account_id() -> str:
+    """Who is signed in to Claude on this PC, as a SHA-256 fingerprint of the account's email: enough to recognise
+    the same person's parts folder on another PC, without writing the email itself into a (synced) folder."""
+    if not _account["id"]:
+        claude_auth(force=True)
+    return _account["id"]
 
 
 def claude_auth(force: bool = False) -> dict:
@@ -302,6 +311,11 @@ def claude_auth(force: bool = False) -> dict:
                                encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             d = json.loads(r.stdout or "{}")
             v["loggedIn"] = bool(d.get("loggedIn"))
+            email = str(d.get("email") or "").strip().lower() if v["loggedIn"] else ""
+            import hashlib
+            _account["id"] = hashlib.sha256(email.encode()).hexdigest() if email else ""
+            if _account["id"]:
+                stamp_owner()
             v["plan"] = str(d.get("subscriptionType") or d.get("planTier") or ("API key" if d.get("authMethod") == "api_key" else "") or "")
         except (OSError, ValueError, subprocess.TimeoutExpired) as e:
             v["error"] = str(e)[:200]
@@ -1378,7 +1392,208 @@ def activate_profile(pid: str | None) -> bool:
     if d["active"] != pid:
         d["active"] = pid
         save_profiles(d)
+    stamp_owner(folder, prof.get("name", ""))
     return True
+
+
+OWNER_FILE = "owner.json"  # in .cadparts: {"name", "account"} so a new PC can recognise its owner's folder
+
+
+def read_owner(folder: Path) -> dict:
+    try:
+        o = json.loads((folder / META / OWNER_FILE).read_text(encoding="utf-8"))
+        return o if isinstance(o, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def stamp_owner(folder: Path | None = None, name: str = "") -> None:
+    """Remember which Claude account (fingerprint) and name this parts folder belongs to. A folder that already
+    belongs to another account is left alone."""
+    folder = folder or ROOT
+    acct = _account["id"]
+    if not folder or not acct or not (folder / META).is_dir():
+        return
+    o = read_owner(folder)
+    if o.get("account") and o["account"] != acct:
+        return
+    if not name:
+        prof = next((x for x in load_profiles()["profiles"]
+                     if os.path.realpath(x["folder"]).lower() == os.path.realpath(folder).lower()), None)
+        name = (prof or {}).get("name") or o.get("name") or ""
+    if o.get("account") == acct and o.get("name") == name:
+        return
+    try:
+        (folder / META / OWNER_FILE).write_text(json.dumps({"name": name, "account": acct}, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def sync_roots() -> list[Path]:
+    """Where a parts folder can live: the sync services' folders on this PC (OneDrive, Dropbox, Google Drive,
+    iCloud Drive, Box), plus Documents, Desktop and the home folder."""
+    home, roots = Path.home(), []
+    for var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        if os.environ.get(var):
+            roots.append(Path(os.environ[var]))
+    for info in (Path(os.environ.get("APPDATA", "")) / "Dropbox" / "info.json",
+                 Path(os.environ.get("LOCALAPPDATA", "")) / "Dropbox" / "info.json"):
+        try:
+            roots += [Path(v["path"]) for v in json.loads(info.read_text(encoding="utf-8")).values() if v.get("path")]
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+    roots += [home / "Dropbox", home / "Google Drive", home / "My Drive", home / "iCloudDrive", home / "Box"]
+    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":  # Google Drive for desktop shows up as a drive with "My Drive" in it
+        roots.append(Path(f"{letter}:\\My Drive"))
+    roots += [_known_folder(5) or home / "Documents", _known_folder(16) or home / "Desktop", home]
+    out, seen = [], set()
+    for r in roots:
+        try:
+            if r and r.is_dir():
+                key = os.path.realpath(r).lower()
+                if key not in seen:
+                    seen.add(key); out.append(r)
+        except OSError:
+            pass
+    return out
+
+
+_found_cache = {"t": 0.0, "v": []}
+
+
+def find_parts_folders(max_dirs: int = 600) -> list[dict]:
+    """Every CAD Parts folder (one with a .cadparts folder) up to two levels inside sync_roots() (cached a minute)."""
+    if time.time() - _found_cache["t"] < 60:
+        return _found_cache["v"]
+    found, seen = [], set()
+
+    def look(d: Path):
+        key = os.path.realpath(d).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        if (d / META).is_dir():
+            o = read_owner(d)
+            found.append({"folder": str(d), "name": o.get("name", ""), "account": o.get("account", ""), "parts": count_parts(d)})
+
+    for root in sync_roots():
+        budget = max_dirs
+        try:
+            level1 = [x for x in root.iterdir() if x.is_dir() and not x.name.startswith((".", "$"))]
+        except OSError:
+            continue
+        for d1 in level1[:budget]:
+            look(d1)
+            if (d1 / META).is_dir():
+                continue
+            try:
+                kids = [x for x in d1.iterdir() if x.is_dir() and not x.name.startswith((".", "$"))]
+            except OSError:
+                continue
+            budget -= len(kids)
+            for d2 in kids[:max(0, budget)]:
+                look(d2)
+    _found_cache.update(t=time.time(), v=found)
+    return found
+
+
+def find_my_folder() -> dict | None:
+    """After signing in on a new PC: the parts folder that belongs to this Claude account, if one is here."""
+    acct = account_id()
+    if not acct:
+        return None
+    taken = {os.path.realpath(x["folder"]).lower() for x in load_profiles()["profiles"]}
+    mine = [f for f in find_parts_folders() if f["account"] == acct and os.path.realpath(f["folder"]).lower() not in taken]
+    mine.sort(key=lambda f: -f["parts"])
+    return {k: mine[0][k] for k in ("folder", "name", "parts")} if mine else None
+
+
+# ---------------------------------------------------------------- Export My Parts / import a CAD Parts file
+EXPORT_MANIFEST = "cadparts-export.json"
+HIDE_ON_IMPORT = {".py", ".md", ".json"}  # scripts, notes and chats are kept hidden in part folders
+
+
+def _export_members(root: Path) -> list[Path]:
+    files = [f for f in root.iterdir() if f.is_file() and f.suffix.lower() == ".md"]  # CLAUDE.md and other notes
+    for d in sorted(root.iterdir(), key=lambda x: x.name.lower()):
+        if d.is_dir() and (d.name == META or (not d.name.startswith((".", "_")) and (d.name not in SKIP_DIRS or d.name == "ready-to-print"))):
+            files += [f for f in d.rglob("*") if f.is_file() and not f.name.endswith(".tmp")]
+    return files
+
+
+def export_parts(dest: str, name: str) -> None:
+    """One .zip with every part (all versions, scripts, notes, chats), ready-to-print, and the app's data for this
+    folder (favorites, categories, settings, printers, pictures), plus a small manifest for importing."""
+    _job("export", state="running", step="Packing your parts…", pct=0.0, error="", url="")
+    root = ROOT
+    files = _export_members(root)
+    out = Path(dest)
+    tmp = out.with_name(out.name + ".partial")
+    st = load_state()
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        z.writestr(EXPORT_MANIFEST, json.dumps({"app": "CAD Parts", "version": APP_VERSION, "name": name,
+                                                "parts": count_parts(root), "printers": st["settings"]["printers"],
+                                                "printer": st["settings"]["printer"],
+                                                "exported": time.strftime("%Y-%m-%d %H:%M")}, indent=2))
+        for i, f in enumerate(files):
+            z.write(f, f.relative_to(root).as_posix())
+            if i % 20 == 0:
+                _job("export", pct=i / max(1, len(files)))
+    os.replace(tmp, out)
+    _job("export", state="done", pct=1.0, url=str(out))
+
+
+def peek_export(path: str) -> dict:
+    try:
+        with zipfile.ZipFile(path) as z:
+            m = json.loads(z.read(EXPORT_MANIFEST))
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return {"ok": False, "error": "that isn't a CAD Parts file"}
+    return {"ok": True, "name": str(m.get("name") or ""), "parts": int(m.get("parts") or 0),
+            "printers": clean_printers(m.get("printers")), "printer": str(m.get("printer") or ""),
+            "exported": str(m.get("exported") or "")}
+
+
+def import_parts(path: str, folder: Path) -> dict:
+    """Unpack a CAD Parts file into `folder`. Parts the folder already has are left alone (reported back)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    have = {d.name.lower() for d in folder.iterdir() if d.is_dir()}
+    skipped, n = set(), 0
+    with zipfile.ZipFile(path) as z:
+        for info in z.infolist():
+            name = info.filename
+            parts = Path(name).parts
+            if info.is_dir() or name == EXPORT_MANIFEST or not parts or Path(name).is_absolute() or ".." in parts or ":" in name:
+                continue
+            top = parts[0]
+            if len(parts) > 1 and top != META and top.lower() in have:
+                skipped.add(top); continue
+            target = folder / Path(*parts)
+            if top == META and target.exists():
+                continue  # this folder's own app data wins
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(info) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            mt = time.mktime(info.date_time + (0, 0, -1))  # keep the parts' dates (the list is sorted by them)
+            os.utime(target, (mt, mt))
+            if len(parts) == 2 and top != META and (target.suffix.lower() in HIDE_ON_IMPORT):
+                _set_hidden(target)
+            n += 1
+    if (folder / META).is_dir():
+        _set_hidden(folder / META)
+    return {"files": n, "skipped": sorted(skipped)}
+
+
+def pick_file(start: str = "") -> str | None:
+    """Windows' file picker for a CAD Parts file (when the app window can't show its own)."""
+    ps = ("Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog;"
+          "$f.Title = 'Choose your CAD Parts file'; $f.Filter = 'CAD Parts file (*.zip)|*.zip';"
+          "$f.InitialDirectory = " + _ps_lit(start or str(Path.home() / "Downloads")) + ";"
+          "$o = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false};"
+          "if ($f.ShowDialog($o) -eq 'OK') { $f.FileName }")
+    r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], capture_output=True, text=True, timeout=600)
+    out = (r.stdout or "").strip().splitlines()
+    return out[-1] if out else None
 
 
 def _known_folder(csidl: int) -> Path | None:
@@ -1404,6 +1619,7 @@ def detect_folders() -> dict:
     for base in [onedrive, docs, home]:
         if base:
             cands += [base / "cad-parts", base / "CAD Parts"]
+    cands += [Path(f["folder"]) for f in find_parts_folders()]  # Dropbox, Google Drive, iCloud… too
     taken = {os.path.realpath(x["folder"]).lower() for x in load_profiles()["profiles"]}
     existing, seen = [], set()
     for c in cands:
@@ -1453,6 +1669,14 @@ def save_profile(body: dict) -> dict:
     if any(os.path.realpath(x["folder"]).lower() == os.path.realpath(folder).lower() and x is not prof for x in d["profiles"]):
         return {"ok": False, "error": "another profile already uses that folder"}
     printers = clean_printers(body.get("printers"))
+    imported = None
+    if body.get("import"):
+        if not peek_export(str(body["import"])).get("ok"):
+            return {"ok": False, "error": "that isn't a CAD Parts file"}
+        try:
+            imported = import_parts(str(body["import"]), Path(folder))
+        except (OSError, zipfile.BadZipFile) as e:
+            return {"ok": False, "error": f"couldn't unpack it ({getattr(e, 'strerror', None) or e})"}
     try:
         prepare_folder(Path(folder), printers)
     except OSError as e:
@@ -1471,7 +1695,7 @@ def save_profile(body: dict) -> dict:
             st["settings"]["printers"] = printers
             st["settings"]["printer"] = default if default in [x["name"] for x in printers] else ""
     update_state(fn)
-    return {"ok": True, "id": prof["id"]}
+    return {"ok": True, "id": prof["id"], **({"imported": imported} if imported else {})}
 
 
 def remove_profile(pid: str) -> dict:
@@ -1799,6 +2023,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(apps_info())
         if u.path == "/api/health":
             return self.json(health(force="force" in u.query))
+        if u.path == "/api/profile/find":  # first start on a new PC, after signing in
+            return self.json({"match": find_my_folder()})
+        if u.path == "/api/import/peek":
+            return self.json(peek_export(parse_qs(u.query).get("file", [""])[0]))
+        if u.path == "/api/job":
+            return self.json(_jobs.get(parse_qs(u.query).get("what", [""])[0]) or {})
         if u.path == "/api/folderinfo":
             return self.json(folder_info(parse_qs(u.query).get("path", [""])[0]))
         if u.path == "/api/chats":
@@ -1908,6 +2138,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(remove_profile(q.get("id", [""])[0]))
         if u.path == "/api/setup":
             return self.json(setup_action(q.get("what", [""])[0], q.get("code", [""])[0]))
+        if u.path == "/api/pickfile":
+            return self.json({"path": pick_file(q.get("start", [""])[0])})
+        if u.path == "/api/export":
+            dest = q.get("dest", [""])[0]
+            if not dest and q.get("name"):  # no save dialog (a browser, an older app window): Downloads
+                dest = str(Path.home() / "Downloads" / re.sub(r'[<>:"/\\|?*]', "", q["name"][0])[:120])
+            if ROOT is None or not dest or not Path(dest).is_absolute() or not dest.lower().endswith(".zip"):
+                return self.json({"ok": False, "error": "choose where to save it"})
+            if (_jobs.get("export") or {}).get("state") == "running":
+                return self.json({"ok": True})
+            name = next((x["name"] for x in load_profiles()["profiles"] if x["id"] == load_profiles()["active"]), "")
+            _jobs.pop("export", None)
+            threading.Thread(target=_run_job, args=("export", lambda: export_parts(dest, name)), daemon=True).start()
+            return self.json({"ok": True})
         if u.path == "/api/pickfolder":
             return self.json({"path": pick_folder(q.get("start", [""])[0])})
         if ROOT is None and u.path not in ("/api/quit", "/api/chat/stop"):
@@ -1993,6 +2237,7 @@ def main():
     # warm the build123d worker in the background so the first build doesn't wait ~10 s for the import
     # (on a new PC this is also when build123d gets downloaded; the setup checklist shows its progress)
     threading.Thread(target=warm_worker, daemon=True).start()
+    threading.Thread(target=claude_auth, kwargs={"force": True}, daemon=True).start()
     if "--open" in sys.argv:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     srv.serve_forever()
