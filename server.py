@@ -179,7 +179,7 @@ def health(force: bool = False) -> dict:
          "detail": "Found" if bambu else "Optional: for the Open in Bambu Studio button", "action": "download"},
     ]
     return {"checks": checks, "ready": all(c["ok"] for c in checks if c["required"]),
-            "tools": {"blender": bool(blender), "bambu": bool(bambu)}}
+            "tools": {"blender": bool(blender), "bambu": bool(bambu)}, "jobs": {k: dict(v) for k, v in _jobs.items()}}
 
 
 # ---------------------------------------------------------------- version + update check (GitHub Releases)
@@ -219,37 +219,119 @@ def update_info() -> dict:
     return info
 
 
-DOWNLOADS = {"blender": "https://www.blender.org/download/", "bambu": "https://bambulab.com/en/download/studio",
-             "claude": "https://claude.com/product/claude-code"}
+DOWNLOADS = {"blender": "https://www.blender.org/download/", "bambu": "https://bambulab.com/en/download/studio"}
+
+# ---------------------------------------------------------------- setup jobs: installs and sign-in, all without windows
+# Each runs in the background; the setup screen polls /api/health and shows progress from _jobs.
+_jobs: dict[str, dict] = {}  # what -> {"state": running|done|failed, "step": str, "pct": float|None, "error": str, "url": str}
+_job_procs: dict[str, subprocess.Popen] = {}
 
 
-def _console(title: str, ps: str) -> None:
-    """Run a PowerShell command in a visible console window, so the user sees (and answers) what it asks."""
-    script = ps + "; Write-Host ''; Read-Host 'Done. Press Enter to close this window'"
-    subprocess.Popen(["cmd", "/c", "start", title, "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+def _job(what: str, **kw) -> None:
+    _jobs.setdefault(what, {"state": "running", "step": "", "pct": None, "error": "", "url": ""}).update(kw)
+
+
+def _install_claude() -> None:
+    """Anthropic's official installer (claude.exe goes to %USERPROFILE%/.local/bin), run hidden."""
+    _job("claude", state="running", step="Installing Claude Code…", pct=None, error="")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                            "irm https://claude.ai/install.ps1 | iex"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=1200)
+        if find_claude():
+            _job("claude", state="done", step="Installed")
+        else:
+            _job("claude", state="failed", error=((r.stderr or r.stdout or "").strip().splitlines() or ["the installer stopped"])[-1][:200])
+    except Exception as e:  # noqa: BLE001
+        _job("claude", state="failed", error=str(e)[:200])
+
+
+def _install_git() -> None:
+    """Git for Windows' own installer from its GitHub release: downloaded with progress, installed silently for this
+    Windows user only (no admin prompt), to %LOCALAPPDATA%/Programs/Git."""
+    _job("git", state="running", step="Finding the latest Git for Windows…", pct=None, error="")
+    try:
+        req = urllib.request.Request("https://api.github.com/repos/git-for-windows/git/releases/latest",
+                                     headers={"Accept": "application/vnd.github+json", "User-Agent": "cad-parts-app"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            rel = json.loads(resp.read().decode("utf-8"))
+        asset = next(a for a in rel.get("assets", []) if re.fullmatch(r"Git-[\d.]+-64-bit\.exe", a.get("name", "")))
+        dest = Path(os.environ.get("TEMP", str(Path.home()))) / asset["name"]
+        total = int(asset.get("size") or 0)
+        with urllib.request.urlopen(urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": "cad-parts-app"}),
+                                    timeout=60) as resp, open(dest, "wb") as out:
+            got = 0
+            while True:
+                chunk = resp.read(1 << 18)
+                if not chunk:
+                    break
+                out.write(chunk)
+                got += len(chunk)
+                _job("git", step="Downloading Git for Windows…", pct=round(got / total, 3) if total else None)
+        _job("git", step="Installing Git for Windows…", pct=None)
+        subprocess.run([str(dest), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/SP-", "/CURRENTUSER"],
+                       timeout=1200)
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        if find_git_bash():
+            _job("git", state="done", step="Installed")
+        else:
+            _job("git", state="failed", error="the Git installer finished but Git wasn't found")
+    except StopIteration:
+        _job("git", state="failed", error="couldn't find the Git installer on GitHub")
+    except Exception as e:  # noqa: BLE001
+        _job("git", state="failed", error=str(e)[:200])
+
+
+def _sign_in() -> None:
+    """`claude auth login`, hidden: it opens the browser itself and waits there; we keep its link for "open it again"."""
+    exe = find_claude()
+    old = _job_procs.pop("signin", None)
+    if old and old.poll() is None:
+        old.kill()
+    _job("signin", state="running", step="Finish signing in in your browser", pct=None, error="", url="")
+    try:
+        proc = subprocess.Popen([exe, "auth", "login"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+        _job_procs["signin"] = proc
+        for line in proc.stdout:
+            m = re.search(r"https://\S+", line)
+            if m and not _jobs["signin"].get("url"):
+                _job("signin", url=m.group(0))
+        proc.wait(timeout=1800)
+        _auth_cache["v"] = None
+        if claude_auth(force=True).get("loggedIn"):
+            _job("signin", state="done", step="Signed in")
+        elif _job_procs.get("signin") is proc:  # not replaced by a newer attempt
+            _job("signin", state="failed", error="the sign-in didn't finish")
+    except Exception as e:  # noqa: BLE001
+        _job("signin", state="failed", error=str(e)[:200])
+
+
+def _open_signin_page() -> dict:
+    url = (_jobs.get("signin") or {}).get("url") or ""
+    host = urlparse(url).hostname or ""
+    if url.startswith("https://") and (host == "claude.ai" or host.endswith((".claude.ai", ".anthropic.com", ".claude.com"))
+                                       or host in ("anthropic.com", "claude.com")):
+        os.startfile(url)
+        return {"ok": True}
+    return {"ok": False, "error": "no sign-in page to open"}
 
 
 def setup_action(what: str) -> dict:
-    """The buttons on the setup checklist. Installs use each tool's official installer, in a window the user can see."""
-    if what == "claude":  # Anthropic's official installer (claude.exe goes to %USERPROFILE%\.local\bin)
-        _console("Installing Claude Code", "irm https://claude.ai/install.ps1 | iex")
-    elif what == "git":
-        if shutil.which("winget"):  # winget asks the user to accept Git's terms in that window
-            _console("Installing Git for Windows", "winget install --id Git.Git -e --source winget")
-        else:  # no winget (e.g. Windows Sandbox, some older PCs): Git for Windows' own installer from its GitHub release
-            _console("Installing Git for Windows",
-                     "$r = Invoke-RestMethod https://api.github.com/repos/git-for-windows/git/releases/latest; "
-                     "$a = $r.assets | Where-Object { $_.name -like 'Git-*-64-bit.exe' } | Select-Object -First 1; "
-                     "if (-not $a) { throw 'Could not find the Git installer - get it from https://git-scm.com/download/win' }; "
-                     "$f = Join-Path $env:TEMP $a.name; Write-Host ('Downloading ' + $a.name + '...'); "
-                     "Invoke-WebRequest $a.browser_download_url -OutFile $f -UseBasicParsing; "
-                     "Write-Host 'Opening the Git installer: the default choices are fine.'; Start-Process $f -Wait")
-    elif what == "signin":
-        exe = find_claude()
-        if not exe:
+    """The setup screen's buttons. Everything runs in the background with no windows; progress shows in the app."""
+    starters = {"claude": _install_claude, "git": _install_git, "signin": _sign_in}
+    if what in starters:
+        if what == "signin" and not find_claude():
             return {"ok": False, "error": "install Claude Code first"}
-        _auth_cache["v"] = None
-        _console("Sign in to Claude", f"& '{exe}' auth login")
+        if (_jobs.get(what) or {}).get("state") == "running" and what != "signin":
+            return {"ok": True}  # already on it
+        _jobs.pop(what, None)
+        threading.Thread(target=starters[what], daemon=True).start()
+    elif what == "signin-page":
+        return _open_signin_page()
     elif what == "build123d":
         threading.Thread(target=warm_worker, daemon=True).start()
     elif what == "update":
@@ -1168,6 +1250,9 @@ def run_chat(handler, message: str, session: str | None, context: str):
         if session:
             args += ["--resume", session]
         prompt = (f"[Dashboard: {context}]\n" if context else "") + message
+        bash = find_git_bash()  # Claude Code finds a per-user Git (not on PATH until the next sign-in) through this
+        if bash:
+            os.environ["CLAUDE_CODE_GIT_BASH_PATH"] = bash
         try:
             proc = subprocess.Popen(args, cwd=str(ROOT), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")

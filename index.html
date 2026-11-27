@@ -319,8 +319,13 @@
   .citem.wide{grid-column:1 / -1}
   .citem .ci{width:24px;height:24px;flex:none;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:700}
   .citem.ok .ci{background:#143214;color:#8fe08f}
-  .citem.bad .ci{background:#3a2a12;color:#f5c26b}
-  .citem.opt .ci{background:#262624;color:var(--muted)}
+  .citem.todo .ci{background:#1d2733;color:#8fb8ef}
+  .citem .ci svg{display:block}
+  .cbar{width:80%;height:4px;border-radius:2px;background:#262624;overflow:hidden;margin-top:2px}
+  .cbar i{display:block;height:100%;background:var(--accent);border-radius:2px;transition:width .3s}
+  .cbar.indef i{width:35%;animation:cbar 1.3s ease-in-out infinite}
+  @keyframes cbar{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}
+  .clink{background:none;border:none;padding:0;color:#8fb8ef;font-size:12px;text-decoration:underline;cursor:pointer}
   .citem.busy .ci{border:2px solid #3a3a37;border-top-color:var(--accent);animation:spin .9s linear infinite;background:none}
   .citem .ct{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;align-items:center}
   .citem .ct b{font-size:13.5px;font-weight:600}
@@ -520,11 +525,11 @@
     <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round">
       <path d="M12 2.8 20 7.4v9.2L12 21.2 4 16.6V7.4z"/><path d="M4 7.4 12 12l8-4.6M12 12v9.2" stroke-opacity=".75"/></svg></span>
     <h1 id="chkTitle">Getting CAD Parts ready</h1>
-    <p class="sub" id="chkSub">CAD Parts needs two free tools on this PC. Install anything that's missing from here.</p>
+    <p class="sub" id="chkSub">CAD Parts needs two free tools on this PC. Setting them up takes a few minutes.</p>
     <div id="chkNote" class="cnote" hidden></div>
     <div id="chkList" class="clist"></div>
     <p id="chkEngine" class="cengine" hidden></p>
-    <div class="srow"><button type="button" id="chkAgain" class="ghost">Check again</button><button type="button" id="chkDone" class="primary">Continue</button></div>
+    <div class="srow"><button type="button" id="chkDone" class="primary" disabled>Continue</button></div>
   </div>
 </div>
 <div id="toast" class="toast" hidden></div>
@@ -1533,12 +1538,6 @@ function renderAll() {
 // behind it. The CAD engine (Python + build123d) installs itself; it's only mentioned while it's busy or if it failed.
 let tools = {}; // { blender: bool, bambu: bool }: hides those buttons when the apps aren't installed
 let health = null, healthPoll = null, checksResolve = null;
-const ACTION_NOTE = {
-  claude: 'A window opened that installs Claude Code. Close it when it says it\'s done; this page updates by itself.',
-  signin: 'A window opened to sign in to Claude. Pick your Claude account (or an API key) and finish in your browser.',
-  git: 'A window opened that installs Git for Windows. Answer its questions, or click through its installer with the default choices, then close it when it\'s done.',
-  build123d: 'Setting up the CAD engine again…',
-};
 const chk = id => (health && health.checks.find(c => c.id === id)) || {};
 const coreReady = () => !!(chk('claude').ok && chk('signin').ok && chk('git').ok);
 async function fetchHealth(force) {
@@ -1550,44 +1549,64 @@ async function fetchHealth(force) {
   if (data) renderDetail();
   return health;
 }
+const ICON = {
+  ok: '✓',
+  install: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/></svg>',
+  signin: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8.5" r="3.5"/><path d="M5 20c1.2-3.4 3.8-5 7-5s5.8 1.6 7 5"/></svg>',
+};
+const job = id => ((health && health.jobs) || {})[id] || null;
+// one card per tool: what state it's in, what it says, and the one thing you can do (if any)
 function checkRows() {
   const cl = chk('claude'), si = chk('signin'), gi = chk('git');
-  const claude = !cl.ok ? { detail: 'Runs the chat that designs your parts.', what: 'claude', label: 'Install' }
-    : !si.ok ? { detail: 'Installed. Now sign in with your Claude account (Pro, Max or an API key).', what: 'signin', label: 'Sign in' }
-    : { ok: true, detail: si.detail ? 'Signed in · ' + si.detail : 'Signed in' };
-  const git = gi.ok ? { ok: true, detail: 'Installed' } : { detail: 'Claude Code needs it to run commands on Windows.', what: 'git', label: 'Install' };
+  const jc = job('claude'), js = job('signin'), jg = job('git');
+  let claude;
+  if (!cl.ok) {
+    claude = jc && jc.state === 'running' ? { state: 'busy', detail: jc.step || 'Installing…', bar: null }
+      : jc && jc.state === 'failed' ? { state: 'todo', icon: 'install', detail: 'Couldn\'t install: ' + jc.error, what: 'claude', label: 'Try again' }
+      : { state: 'todo', icon: 'install', detail: 'Needs to be installed', what: 'claude', label: 'Install' };
+  } else if (!si.ok) {
+    claude = js && js.state === 'running' ? { state: 'busy', detail: 'Finish signing in in your browser', link: js.url ? 'Open the sign-in page again' : '' }
+      : js && js.state === 'failed' ? { state: 'todo', icon: 'signin', detail: 'Sign-in didn\'t finish', what: 'signin', label: 'Sign in' }
+      : { state: 'todo', icon: 'signin', detail: 'Needs you to sign in with your Claude account', what: 'signin', label: 'Sign in' };
+  } else claude = { state: 'ok', detail: si.detail ? 'Ready · ' + si.detail : 'Ready' };
+  const git = gi.ok ? { state: 'ok', detail: 'Ready' }
+    : jg && jg.state === 'running' ? { state: 'busy', detail: jg.step || 'Installing…', bar: jg.pct }
+    : jg && jg.state === 'failed' ? { state: 'todo', icon: 'install', detail: 'Couldn\'t install: ' + jg.error, what: 'git', label: 'Try again' }
+    : { state: 'todo', icon: 'install', detail: 'Needs to be installed', what: 'git', label: 'Install' };
   return [{ name: 'Claude Code', ...claude }, { name: 'Git for Windows', ...git }];
 }
 function renderChecks() {
   if (!health) return;
-  $('chkList').innerHTML = checkRows().map(r => `<div class="citem ${r.ok ? 'ok' : 'bad'}"><span class="ci">${r.ok ? '✓' : '!'}</span>
-      <span class="ct"><b>${esc(r.name)}</b><small>${esc(r.detail)}</small></span>
-      ${r.ok ? '' : `<button type="button" class="primary" data-what="${r.what}">${r.label}</button>`}</div>`).join('');
+  $('chkNote').hidden = true;
+  $('chkList').innerHTML = checkRows().map(r => {
+    const icon = r.state === 'busy' ? '' : r.state === 'ok' ? ICON.ok : ICON[r.icon];
+    const bar = r.state !== 'busy' || r.link !== undefined ? ''
+      : r.bar == null ? '<div class="cbar indef"><i></i></div>' : `<div class="cbar"><i style="width:${Math.round(r.bar * 100)}%"></i></div>`;
+    const link = r.link ? `<button type="button" class="clink" data-what="signin-page">${esc(r.link)}</button>` : '';
+    const btn = r.what ? `<button type="button" class="primary" data-what="${r.what}">${r.label}</button>` : '';
+    return `<div class="citem ${r.state}"><span class="ci">${icon}</span>
+      <span class="ct"><b>${esc(r.name)}</b><small>${esc(r.detail)}</small></span>${bar}${link}${btn}</div>`;
+  }).join('');
   $('chkList').querySelectorAll('button[data-what]').forEach(b => b.onclick = async () => {
-    const what = b.dataset.what;
     b.disabled = true;
-    const r = await post('/api/setup?what=' + encodeURIComponent(what));
-    $('chkNote').hidden = false;
-    $('chkNote').textContent = r.ok ? ACTION_NOTE[what] || 'Working…' : 'Couldn\'t start that: ' + (r.error || 'failed');
-    watchHealth();
+    const r = await post('/api/setup?what=' + encodeURIComponent(b.dataset.what));
+    if (!r.ok) { $('chkNote').hidden = false; $('chkNote').textContent = 'Couldn\'t start that: ' + (r.error || 'failed'); return; }
+    await fetchHealth(true); renderChecks();
   });
   const e = chk('build123d');
   $('chkEngine').hidden = !e.id || e.ok;
   $('chkEngine').innerHTML = e.busy ? 'Setting up the CAD engine in the background. The first time takes a few minutes.'
     : e.id && !e.ok ? 'The CAD engine didn\'t start.<button type="button" id="chkEngineRetry">Try again</button>' : '';
-  const retry = $('chkEngineRetry'); if (retry) retry.onclick = async () => { await post('/api/setup?what=build123d'); watchHealth(); };
+  const retry = $('chkEngineRetry'); if (retry) retry.onclick = async () => { await post('/api/setup?what=build123d'); fetchHealth(true).then(renderChecks); };
   $('chkTitle').textContent = coreReady() ? 'You\'re all set' : 'Getting CAD Parts ready';
-  $('chkDone').textContent = coreReady() ? 'Continue' : 'Continue anyway';
+  $('chkDone').disabled = !coreReady(); // both tools are required: no way past this until they're ready
 }
-function watchHealth() { // while the checklist is open: re-check every few seconds (installs and sign-in happen elsewhere)
+function watchHealth() { // while the setup screen is open it keeps checking by itself
   clearInterval(healthPoll);
-  let n = 0;
   healthPoll = setInterval(async () => {
-    if ($('checks').hidden || ++n > 200) { clearInterval(healthPoll); return; }
-    const before = coreReady();
+    if ($('checks').hidden) { clearInterval(healthPoll); return; }
     await fetchHealth(true); renderChecks();
-    if (coreReady() && !before) { $('chkNote').hidden = false; $('chkNote').textContent = 'Everything CAD Parts needs is ready.'; }
-  }, 3000);
+  }, 2500);
 }
 function openChecks() { // resolves when the checklist is closed
   if ($('checks').hidden) closePanels(); // close other panels first
@@ -1598,10 +1617,11 @@ function openChecks() { // resolves when the checklist is closed
   return new Promise(res => { checksResolve = res; });
 }
 function closeChecks() {
+  if (!coreReady()) return false; // required: stays open until Claude Code (signed in) and Git are ready
   $('checks').hidden = true; clearInterval(healthPoll);
   if (checksResolve) { const r = checksResolve; checksResolve = null; r(); }
+  return true;
 }
-$('chkAgain').onclick = async () => { $('chkAgain').disabled = true; await fetchHealth(true); renderChecks(); $('chkAgain').disabled = false; };
 $('chkDone').onclick = () => closeChecks();
 // first start on this PC (or the last check failed): the checklist comes first, before the profile and the home screen
 let checkedOnStart = false;
@@ -1611,6 +1631,7 @@ if (localStorage.getItem('cad-setup-ok') !== '1') {
   $('chkList').innerHTML = '<div class="citem busy wide"><span class="ci"></span><span class="ct"><b>Checking this PC…</b></span></div>';
   if (await fetchHealth(true)) {
     if (!coreReady()) { renderChecks(); watchHealth(); await new Promise(res => { checksResolve = res; }); }
+    else { renderChecks(); }
   }
   $('checks').hidden = true; clearInterval(healthPoll);
 }
@@ -2012,7 +2033,7 @@ function closePanels() { // anything open on top? close it and say so
   if (!$('pmenu').hidden) { $('pmenu').hidden = true; any = true; }
   if (!$('profMenu').hidden) { $('profMenu').hidden = true; $('bProf').classList.remove('on'); any = true; }
   if (!$('setup').hidden && !$('pfCancel').hidden) { $('setup').hidden = true; any = true; }
-  if (!$('checks').hidden) { closeChecks(); any = true; }
+  if (!$('checks').hidden && closeChecks()) any = true;
   const lb = document.querySelector('.lightbox'); if (lb) { lb.remove(); any = true; }
   return any;
 }
