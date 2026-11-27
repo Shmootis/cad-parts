@@ -1407,16 +1407,18 @@ def read_owner(folder: Path) -> dict:
         return {}
 
 
-def stamp_owner(folder: Path | None = None, name: str = "") -> None:
+def stamp_owner(folder: Path | None = None, name: str = "", claim: bool = False) -> None:
     """Remember which Claude account (fingerprint) and name this parts folder belongs to. A folder that already
-    belongs to another account is left alone."""
+    belongs to another account is left alone, unless the user chose to make it theirs (claim)."""
     folder = folder or ROOT
     acct = _account["id"]
     if not folder or not acct or not (folder / META).is_dir():
         return
     o = read_owner(folder)
-    if o.get("account") and o["account"] != acct:
+    if o.get("account") and o["account"] != acct and not claim:
         return
+    if claim:
+        o = {}
     if not name:
         prof = next((x for x in load_profiles()["profiles"]
                      if os.path.realpath(x["folder"]).lower() == os.path.realpath(folder).lower()), None)
@@ -1510,9 +1512,20 @@ def suggest_new_folder() -> dict:
     otherwise Documents. {"folder", "synced": the service's name or ""}."""
     svc = sync_services()
     name, base = svc[0] if svc else ("", _known_folder(5) or Path.home() / "Documents")
-    folder = base / "CAD Parts"
-    n = 2
-    while folder.exists() and not (folder / META).is_dir() and any(folder.iterdir()):  # someone else's "CAD Parts"
+    used = {os.path.realpath(x["folder"]).lower() for x in load_profiles()["profiles"]}
+
+    def free(f: Path) -> bool:
+        if not f.exists():
+            return True
+        if os.path.realpath(f).lower() in used:  # another profile's parts (e.g. a second person on this PC)
+            return False
+        if (f / META).is_dir():  # a parts folder: only if it's nobody else's
+            o = read_owner(f).get("account")
+            return not o or o == _account["id"]
+        return not any(f.iterdir())  # some other "CAD Parts" folder with things in it
+
+    folder, n = base / "CAD Parts", 2
+    while not free(folder):
         folder = base / f"CAD Parts {n}"; n += 1
     return {"folder": str(folder), "synced": name, "label": (name or base.name) + "\\" + folder.name}
 
@@ -1550,6 +1563,28 @@ def first_start(force: bool = False) -> dict:
     pick = lambda f: {k: f[k] for k in ("folder", "name", "parts")} if f else None
     return {"match": pick(mine[0] if mine else None), "candidate": pick(loose[0] if loose else None),
             "suggest": suggest_new_folder(), "name": windows_name()}
+
+
+def parts_elsewhere() -> dict | None:
+    """The open profile's folder is still empty, but this Claude account's parts are in another folder on this PC
+    that no profile uses (they arrived after Start Fresh, e.g. OneDrive finished downloading)."""
+    if ROOT is None or count_parts(ROOT) or not account_id():
+        return None
+    _found_cache["t"] = 0
+    used = {os.path.realpath(x["folder"]).lower() for x in load_profiles()["profiles"]}
+    mine = sorted([f for f in find_parts_folders() if f["account"] == _account["id"] and f["parts"]
+                   and os.path.realpath(f["folder"]).lower() not in used], key=lambda f: -f["parts"])
+    return {**{k: mine[0][k] for k in ("folder", "name", "parts")}, "label": folder_label(mine[0]["folder"])} if mine else None
+
+
+def folder_label(folder: str) -> str:
+    """A folder the way people know it: ...\\OneDrive\\cad-parts -> OneDrive\\cad-parts."""
+    real = os.path.realpath(folder)
+    for name, root in sync_services() + [(p.name, p) for p in (_known_folder(5) or Path.home() / "Documents", Path.home())]:
+        rr = os.path.realpath(root)
+        if real.lower().startswith(rr.lower() + os.sep):
+            return name + "\\" + real[len(rr) + 1:]
+    return folder
 
 
 def find_my_folder() -> dict | None:
@@ -1689,7 +1724,8 @@ def detect_folders() -> dict:
 def folder_info(path: str) -> dict:
     f = Path(path)
     info = {"folder": str(f), "exists": f.is_dir(), "parts": count_parts(f) if f.is_dir() else 0, "printers": [], "printer": "",
-            "owner": read_owner(f).get("name", "") if f.is_dir() else ""}
+            "owner": read_owner(f).get("name", "") if f.is_dir() else "",
+            "othersAccount": bool(f.is_dir() and read_owner(f).get("account") and read_owner(f).get("account") != account_id())}
     try:
         st = json.loads((f / META / "state.json").read_text(encoding="utf-8")).get("settings", {})
         info["printers"], info["printer"] = clean_printers(st.get("printers")), st.get("printer") or ""
@@ -1751,6 +1787,8 @@ def save_profile(body: dict) -> dict:
             st["settings"]["printers"] = printers
             st["settings"]["printer"] = default if default in [x["name"] for x in printers] else ""
     update_state(fn)
+    if body.get("claim"):  # "Make it yours": this Claude account owns the folder from now on
+        stamp_owner(Path(folder), name, claim=True)
     return {"ok": True, "id": prof["id"], **({"imported": imported} if imported else {})}
 
 
@@ -2081,6 +2119,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(health(force="force" in u.query))
         if u.path == "/api/profile/find":  # first start on a new PC, after signing in
             return self.json(first_start(parse_qs(u.query).get("force", [""])[0] == "1"))
+        if u.path == "/api/profile/elsewhere":
+            return self.json({"found": parts_elsewhere()})
         if u.path == "/api/import/peek":
             return self.json(peek_export(parse_qs(u.query).get("file", [""])[0]))
         if u.path == "/api/job":

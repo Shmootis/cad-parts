@@ -1511,7 +1511,9 @@ async function firstStart() {
     const info = await (await fetch('/api/folderinfo?path=' + encodeURIComponent(folder))).json().catch(() => ({}));
     const n = $('stName').value.trim() || info.owner || ''; if (!n) { needName(); return; }
     if (!info.parts && !await askConfirm({ title: 'No parts in that folder', text: 'Keep your new parts there?', ok: 'Use It', danger: false })) return;
-    save({ name: n, folder }, () => { if (info.parts) sessionStorage.setItem('cad-welcome', JSON.stringify({ name: n, parts: info.parts })); });
+    const claim = info.othersAccount; // e.g. you signed in with a different Claude account than before
+    if (claim && !await askConfirm({ title: 'Make These Parts Yours?', text: `They belong to another Claude account${info.owner ? ' (' + info.owner + ')' : ''}.`, ok: 'Make Them Mine', danger: false })) return;
+    save({ name: n, folder, ...(claim ? { claim: true } : {}) }, () => { if (info.parts) sessionStorage.setItem('cad-welcome', JSON.stringify({ name: n, parts: info.parts })); });
   };
   $('stAgain').onclick = async () => {
     f = await look(true);
@@ -1805,6 +1807,17 @@ async function startUpdate() {
     if (j.state === 'done') return;
   }
 }
+// Started fresh before your sync service finished? If this folder is still empty and your own parts have turned up
+// in another folder on this PC, offer to switch to them (once per folder found, unless you say Not Now).
+setTimeout(async () => {
+  const r = await (await fetch('/api/profile/elsewhere', { cache: 'no-store' })).json().catch(() => ({}));
+  const f = r.found; if (!f || localStorage.getItem('cad-elsewhere-no:' + f.folder)) return;
+  if (await askConfirm({ title: `Found Your ${f.parts} Parts`, text: `In ${f.label || f.folder}. Switch to them?`, ok: 'Switch', no: 'Not Now', danger: false })) {
+    const res = await postJSON('/api/profile/save', { id: profId, name: activeProf.name, folder: f.folder });
+    if (res.ok) { sessionStorage.setItem('cad-welcome', JSON.stringify(f)); location.reload(); } else toast('Couldn\'t switch: ' + (res.error || 'failed'));
+  } else localStorage.setItem('cad-elsewhere-no:' + f.folder, '1');
+}, 1500);
+
 // Move to Another PC: Export My Parts saves everything in one .zip (the app window asks where; otherwise Downloads)
 $('sExport').onclick = async () => {
   const name = `CAD Parts - ${activeProf.name} - ${new Date().toISOString().slice(0, 10)}.zip`;
@@ -1849,8 +1862,10 @@ async function changeSaveLocation() {
   const r = { path: await pickFolder(activeProf.folder) };
   if (!r.path || r.path.toLowerCase() === activeProf.folder.toLowerCase()) return;
   if (!await askConfirm({ title: `Save parts in ${r.path}?`, text: 'Nothing is moved. Parts you have now stay where they are.', ok: 'Change', danger: false })) return;
+  const fi = await (await fetch('/api/folderinfo?path=' + encodeURIComponent(r.path))).json().catch(() => ({}));
+  if (fi.othersAccount && !await askConfirm({ title: 'Make These Parts Yours?', text: `They belong to another Claude account${fi.owner ? ' (' + fi.owner + ')' : ''}.`, ok: 'Make Them Mine', danger: false })) return;
   const st = await (await fetch('/api/settings', { cache: 'no-store' })).json().catch(() => ({}));
-  const res = await postJSON('/api/profile/save', { id: profId, name: activeProf.name, folder: r.path, printers: st.printers || [], printer: st.printer || '' });
+  const res = await postJSON('/api/profile/save', { id: profId, name: activeProf.name, folder: r.path, printers: st.printers || [], printer: st.printer || '', ...(fi.othersAccount ? { claim: true } : {}) });
   if (!res.ok) { toast('Couldn\'t change it: ' + (res.error || 'failed')); return; }
   location.reload();
 }

@@ -157,9 +157,33 @@ def main() -> int:
         check(st["match"] and Path(st["match"]["folder"]) == root, "first start: your folder opens straight away", st["match"])
         check(st["candidate"] and st["candidate"]["folder"].endswith("Old Parts"), "first start: an untagged parts folder is offered", st["candidate"])
         check(st["suggest"]["synced"] == "OneDrive" and st["suggest"]["label"] == "OneDrive\\CAD Parts", "first start: new parts go in the synced folder", st["suggest"])
+        # C: a second person (same OneDrive) is never sent into the first person's folder
+        theirs = fake_od / "CAD Parts"
+        (theirs / server.META).mkdir(parents=True)
+        (theirs / server.META / server.OWNER_FILE).write_text(json.dumps({"name": "Other", "account": "someone-else"}))
+        check(server.suggest_new_folder()["folder"].endswith("CAD Parts 2"), "Start Fresh skips someone else's folder")
         server.sync_services = lambda: []
         check(st and server.suggest_new_folder()["synced"] == "" and server.suggest_new_folder()["label"].endswith("\\CAD Parts"), "no sync service: Documents")
         server.sync_services = real_services
+
+        # B: a folder from another Claude account is only taken over when you say so
+        info = server.folder_info(str(theirs))
+        check(info["othersAccount"] and info["owner"] == "Other", "another account's folder is flagged")
+        server.stamp_owner(theirs, "Tester")
+        check(server.read_owner(theirs)["account"] == "someone-else", "…and not taken over by itself")
+        server.stamp_owner(theirs, "Tester", claim=True)
+        check(server.read_owner(theirs) == {"name": "Tester", "account": "test-account"}, "Make Them Mine takes it over")
+
+        # A: started fresh (empty folder) and then your parts turned up somewhere else
+        empty = tmp / "fresh"
+        (empty / server.META).mkdir(parents=True)
+        was_root = server.ROOT
+        server.ROOT = empty
+        server.sync_roots = lambda: [tmp]
+        found = server.parts_elsewhere()
+        check(found and Path(found["folder"]) == root, "your parts turning up later are offered", found)
+        server.ROOT = was_root
+        check(server.parts_elsewhere() is None, "…but not when your folder already has parts")
 
         # --- Export My Parts, then import it on "another PC"
         zip_path = tmp / "export.zip"
