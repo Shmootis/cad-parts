@@ -56,11 +56,25 @@ def install_uv():
     return find_uv()
 
 
+SERVER_LOG = Path.home() / "AppData" / "Local" / "CAD Parts" / "server.log"  # what the server printed (for "why won't it start")
+
+
 def start_server():
+    """Start the server in the background; returns the process so the caller can tell if it died."""
     uv = find_uv() or "uv"
-    subprocess.Popen([uv, "run", "--python", "3.12", "python", "server.py"], cwd=str(APP_DIR),
-                     creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log = open(SERVER_LOG, "w", encoding="utf-8", errors="replace")
+    return subprocess.Popen([uv, "run", "--python", "3.12", "python", "server.py"], cwd=str(APP_DIR),
+                            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+
+
+def log_tail(n=3):
+    try:
+        lines = [x.strip() for x in SERVER_LOG.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()]
+        return " · ".join(lines[-n:])[-300:]
+    except OSError:
+        return ""
 
 
 def wait_for_server(seconds=60):
@@ -138,15 +152,26 @@ def main():
                 if not install_uv():
                     say("Couldn't install uv. Check your internet connection and open CAD Parts again.")
                     return
-            start_server()
+            time.sleep(1)  # an old server that's just been told to stop (e.g. by the installer) needs a moment
+            proc, tries = start_server(), 1
             for i in range(600):  # the first start downloads Python, so allow a few minutes
                 if server_up():
                     break
+                if proc.poll() is not None and not server_up():  # it stopped instead of starting
+                    if tries < 3:
+                        say("Starting CAD Parts… (trying again)")
+                        time.sleep(2)
+                        proc, tries = start_server(), tries + 1
+                        continue
+                    say("CAD Parts couldn't start its server. " + (log_tail() or "No details.")
+                        + " Close this window and open CAD Parts again; if it keeps happening, send this message.")
+                    return
                 if i == 16:
                     say("Starting CAD Parts… the first start downloads Python and can take a few minutes.")
                 time.sleep(0.5)
             else:
-                say("Could not start the CAD Parts server. Try Start CAD Parts.cmd in the app folder.")
+                say("CAD Parts' server is taking very long to start. " + (log_tail() or "")
+                    + " Check your internet connection, then close this window and open CAD Parts again.")
                 return
         win.load_url(URL)
 
