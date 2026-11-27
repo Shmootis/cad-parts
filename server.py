@@ -223,8 +223,17 @@ def setup_action(what: str) -> dict:
     """The buttons on the setup checklist. Installs use each tool's official installer, in a window the user can see."""
     if what == "claude":  # Anthropic's official installer (claude.exe goes to %USERPROFILE%\.local\bin)
         _console("Installing Claude Code", "irm https://claude.ai/install.ps1 | iex")
-    elif what == "git":  # winget asks the user to accept Git's terms in that window
-        _console("Installing Git for Windows", "winget install --id Git.Git -e --source winget")
+    elif what == "git":
+        if shutil.which("winget"):  # winget asks the user to accept Git's terms in that window
+            _console("Installing Git for Windows", "winget install --id Git.Git -e --source winget")
+        else:  # no winget (e.g. Windows Sandbox, some older PCs): Git for Windows' own installer from its GitHub release
+            _console("Installing Git for Windows",
+                     "$r = Invoke-RestMethod https://api.github.com/repos/git-for-windows/git/releases/latest; "
+                     "$a = $r.assets | Where-Object { $_.name -like 'Git-*-64-bit.exe' } | Select-Object -First 1; "
+                     "if (-not $a) { throw 'Could not find the Git installer - get it from https://git-scm.com/download/win' }; "
+                     "$f = Join-Path $env:TEMP $a.name; Write-Host ('Downloading ' + $a.name + '...'); "
+                     "Invoke-WebRequest $a.browser_download_url -OutFile $f -UseBasicParsing; "
+                     "Write-Host 'Opening the Git installer: the default choices are fine.'; Start-Process $f -Wait")
     elif what == "signin":
         exe = find_claude()
         if not exe:
