@@ -313,19 +313,29 @@
   .srow{display:flex;align-items:center;gap:10px;margin-top:4px}
   .perr{color:#f0a0a0;font-size:13px}
   /* setup checklist (tools this PC needs) */
-  .clist{display:flex;flex-direction:column;gap:8px}
-  .citem{display:flex;align-items:center;gap:12px;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+  .clist{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .citem{display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:18px 14px;
+    border:1px solid var(--line);border-radius:12px;background:var(--bg)}
+  .citem.wide{grid-column:1 / -1}
   .citem .ci{width:24px;height:24px;flex:none;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:700}
   .citem.ok .ci{background:#143214;color:#8fe08f}
   .citem.bad .ci{background:#3a2a12;color:#f5c26b}
   .citem.opt .ci{background:#262624;color:var(--muted)}
   .citem.busy .ci{border:2px solid #3a3a37;border-top-color:var(--accent);animation:spin .9s linear infinite;background:none}
-  .citem .ct{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+  .citem .ct{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;align-items:center}
   .citem .ct b{font-size:13.5px;font-weight:600}
   .citem .ct b em{font-style:normal;font-weight:400;color:var(--muted);font-size:12px;margin-left:6px}
   .citem .ct small{color:var(--muted);font-size:12px}
   .citem button{flex:none;font-size:12.5px;padding:5px 12px}
-  .cnote{color:var(--ink-2);font-size:12.5px;background:#1d2733;border:1px solid #33465f;border-radius:8px;padding:8px 11px}
+  .cnote{color:var(--ink-2);font-size:12.5px;background:#1d2733;border:1px solid #33465f;border-radius:8px;padding:8px 11px;text-align:center}
+  /* setup cards: logo, title and text centered */
+  .setupcard .mark{align-self:center}
+  .setupcard h1,.setupcard .sub{text-align:center}
+  #checks .srow{justify-content:center}
+  .cengine{margin:-4px 0 0;text-align:center;color:var(--muted);font-size:12.5px}
+  .cengine button{margin-left:6px;font-size:12px;padding:3px 10px}
+  /* until the first checks are done, nothing of the app is drawn (no flash behind the setup cards) */
+  body.booting > header, body.booting > main{visibility:hidden}
 
   /* settings panel (same drop-down style as the Recycle Bin) */
   .setbody{overflow:auto}
@@ -391,7 +401,7 @@
     justify-content:center;z-index:30;color:var(--ink-2);font-size:15px;text-align:center}
 </style>
 </head>
-<body>
+<body class="booting">
 <header>
   <div class="brand">
     <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round">
@@ -510,10 +520,11 @@
     <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round">
       <path d="M12 2.8 20 7.4v9.2L12 21.2 4 16.6V7.4z"/><path d="M4 7.4 12 12l8-4.6M12 12v9.2" stroke-opacity=".75"/></svg></span>
     <h1 id="chkTitle">Getting CAD Parts ready</h1>
-    <p class="sub" id="chkSub">CAD Parts uses a few free tools on this PC. Anything missing can be installed from here.</p>
+    <p class="sub" id="chkSub">CAD Parts needs two free tools on this PC. Install anything that's missing from here.</p>
     <div id="chkNote" class="cnote" hidden></div>
     <div id="chkList" class="clist"></div>
-    <div class="srow"><span class="spacer"></span><button type="button" id="chkAgain" class="ghost">Check again</button><button type="button" id="chkDone" class="primary">Continue</button></div>
+    <p id="chkEngine" class="cengine" hidden></p>
+    <div class="srow"><button type="button" id="chkAgain" class="ghost">Check again</button><button type="button" id="chkDone" class="primary">Continue</button></div>
   </div>
 </div>
 <div id="toast" class="toast" hidden></div>
@@ -1517,6 +1528,93 @@ function renderAll() {
 // Each conversation is saved on disk by the server: <part>\\chat.json (hidden) for a part, .cadparts\\chats\\new.json in the parts folder
 // for the new part being described. So chats sync with OneDrive and are the same in Firefox and the app.
 // The server runs one Claude turn at a time.
+// ---------- setup checklist: what this PC needs for the app to work (Claude Code + sign-in, Git) ----------
+// On a PC that hasn't passed it yet, this runs before anything else is drawn, so the home screen never flashes
+// behind it. The CAD engine (Python + build123d) installs itself; it's only mentioned while it's busy or if it failed.
+let tools = {}; // { blender: bool, bambu: bool }: hides those buttons when the apps aren't installed
+let health = null, healthPoll = null, checksResolve = null;
+const ACTION_NOTE = {
+  claude: 'A window opened that installs Claude Code. Close it when it says it\'s done; this page updates by itself.',
+  signin: 'A window opened to sign in to Claude. Pick your Claude account (or an API key) and finish in your browser.',
+  git: 'A window opened that installs Git for Windows. Answer its questions, or click through its installer with the default choices, then close it when it\'s done.',
+  build123d: 'Setting up the CAD engine again…',
+};
+const chk = id => (health && health.checks.find(c => c.id === id)) || {};
+const coreReady = () => !!(chk('claude').ok && chk('signin').ok && chk('git').ok);
+async function fetchHealth(force) {
+  try { health = await (await fetch('/api/health' + (force ? '?force=1' : ''), { cache: 'no-store' })).json(); }
+  catch { return null; }
+  tools = health.tools || {};
+  if (coreReady()) localStorage.setItem('cad-setup-ok', '1');
+  $('sHealthInfo').textContent = coreReady() ? 'All set' : 'Something needs attention';
+  if (data) renderDetail();
+  return health;
+}
+function checkRows() {
+  const cl = chk('claude'), si = chk('signin'), gi = chk('git');
+  const claude = !cl.ok ? { detail: 'Runs the chat that designs your parts.', what: 'claude', label: 'Install' }
+    : !si.ok ? { detail: 'Installed. Now sign in with your Claude account (Pro, Max or an API key).', what: 'signin', label: 'Sign in' }
+    : { ok: true, detail: si.detail ? 'Signed in · ' + si.detail : 'Signed in' };
+  const git = gi.ok ? { ok: true, detail: 'Installed' } : { detail: 'Claude Code needs it to run commands on Windows.', what: 'git', label: 'Install' };
+  return [{ name: 'Claude Code', ...claude }, { name: 'Git for Windows', ...git }];
+}
+function renderChecks() {
+  if (!health) return;
+  $('chkList').innerHTML = checkRows().map(r => `<div class="citem ${r.ok ? 'ok' : 'bad'}"><span class="ci">${r.ok ? '✓' : '!'}</span>
+      <span class="ct"><b>${esc(r.name)}</b><small>${esc(r.detail)}</small></span>
+      ${r.ok ? '' : `<button type="button" class="primary" data-what="${r.what}">${r.label}</button>`}</div>`).join('');
+  $('chkList').querySelectorAll('button[data-what]').forEach(b => b.onclick = async () => {
+    const what = b.dataset.what;
+    b.disabled = true;
+    const r = await post('/api/setup?what=' + encodeURIComponent(what));
+    $('chkNote').hidden = false;
+    $('chkNote').textContent = r.ok ? ACTION_NOTE[what] || 'Working…' : 'Couldn\'t start that: ' + (r.error || 'failed');
+    watchHealth();
+  });
+  const e = chk('build123d');
+  $('chkEngine').hidden = !e.id || e.ok;
+  $('chkEngine').innerHTML = e.busy ? 'Setting up the CAD engine in the background. The first time takes a few minutes.'
+    : e.id && !e.ok ? 'The CAD engine didn\'t start.<button type="button" id="chkEngineRetry">Try again</button>' : '';
+  const retry = $('chkEngineRetry'); if (retry) retry.onclick = async () => { await post('/api/setup?what=build123d'); watchHealth(); };
+  $('chkTitle').textContent = coreReady() ? 'You\'re all set' : 'Getting CAD Parts ready';
+  $('chkDone').textContent = coreReady() ? 'Continue' : 'Continue anyway';
+}
+function watchHealth() { // while the checklist is open: re-check every few seconds (installs and sign-in happen elsewhere)
+  clearInterval(healthPoll);
+  let n = 0;
+  healthPoll = setInterval(async () => {
+    if ($('checks').hidden || ++n > 200) { clearInterval(healthPoll); return; }
+    const before = coreReady();
+    await fetchHealth(true); renderChecks();
+    if (coreReady() && !before) { $('chkNote').hidden = false; $('chkNote').textContent = 'Everything CAD Parts needs is ready.'; }
+  }, 3000);
+}
+function openChecks() { // resolves when the checklist is closed
+  if ($('checks').hidden) closePanels(); // close other panels first
+  $('checks').hidden = false; $('chkNote').hidden = true;
+  if (health) renderChecks();
+  else $('chkList').innerHTML = '<div class="citem busy wide"><span class="ci"></span><span class="ct"><b>Checking this PC…</b></span></div>';
+  fetchHealth(true).then(() => { renderChecks(); watchHealth(); });
+  return new Promise(res => { checksResolve = res; });
+}
+function closeChecks() {
+  $('checks').hidden = true; clearInterval(healthPoll);
+  if (checksResolve) { const r = checksResolve; checksResolve = null; r(); }
+}
+$('chkAgain').onclick = async () => { $('chkAgain').disabled = true; await fetchHealth(true); renderChecks(); $('chkAgain').disabled = false; };
+$('chkDone').onclick = () => closeChecks();
+// first start on this PC (or the last check failed): the checklist comes first, before the profile and the home screen
+let checkedOnStart = false;
+if (localStorage.getItem('cad-setup-ok') !== '1') {
+  checkedOnStart = true;
+  $('checks').hidden = false;
+  $('chkList').innerHTML = '<div class="citem busy wide"><span class="ci"></span><span class="ct"><b>Checking this PC…</b></span></div>';
+  if (await fetchHealth(true)) {
+    if (!coreReady()) { renderChecks(); watchHealth(); await new Promise(res => { checksResolve = res; }); }
+  }
+  $('checks').hidden = true; clearInterval(healthPoll);
+}
+
 // ---------- profiles: who uses this PC and where their parts live ----------
 // No profile yet (first run): show the setup screen and stop here; saving it reloads the page.
 let profiles = { active: null, profiles: [], detected: {} };
@@ -1621,6 +1719,7 @@ if (!activeProf || !profiles.root) {
   await new Promise(() => {}); // the rest of the app starts after the reload
 }
 profId = activeProf.id;
+document.body.classList.remove('booting');
 draftOpen = localStorage.getItem('cad-draft:' + profId) === '1';
 localStorage.removeItem('cad-draft');
 
@@ -1859,66 +1958,7 @@ async function saveSettings() {
 for (const id of ['sModel', 'sKeep', 'sPrinter', 'sNotify']) $(id).onchange = saveSettings;
 $('sEditProf').onclick = () => openProfileForm('edit', activeProf);
 
-// ---------- setup checklist: the tools this PC needs (Claude Code + sign-in, Git, CAD engine; Blender/Bambu optional) ----------
-let tools = {}; // { blender: bool, bambu: bool } once checked
-const ACTION_LABEL = { install: 'Install', signin: 'Sign in', retry: 'Try again', download: 'Download' };
-const ACTION_NOTE = {
-  claude: 'A window opened that installs Claude Code. When it says it\'s done, close it; this list updates by itself.',
-  git: 'A window opened that installs Git for Windows. Answer its questions (Y to accept), or click through Git\'s installer if that opens (the default choices are fine), then close the window when it\'s done.',
-  signin: 'A window opened to sign in to Claude. Pick your Claude account (or an API key) and finish in your browser.',
-  build123d: 'Setting up the CAD engine again…',
-  blender: 'The Blender download page opened in your browser. Install it, then come back.',
-  bambu: 'The Bambu Studio download page opened in your browser. Install it, then come back.',
-};
-let health = null, healthPoll = null;
-async function fetchHealth(force) {
-  try { health = await (await fetch('/api/health' + (force ? '?force=1' : ''), { cache: 'no-store' })).json(); }
-  catch { return null; }
-  tools = health.tools || {};
-  $('sHealthInfo').textContent = health.ready ? 'All set' : 'Something needs attention';
-  if (data) renderDetail();
-  return health;
-}
-function renderChecks() {
-  if (!health) return;
-  $('chkList').innerHTML = health.checks.map(c => {
-    const st = c.busy ? 'busy' : c.ok ? 'ok' : c.required ? 'bad' : 'opt';
-    const btn = !c.ok && c.action && !c.busy ? `<button type="button" data-what="${esc(c.id === 'signin' ? 'signin' : c.id)}">${ACTION_LABEL[c.action]}</button>` : '';
-    return `<div class="citem ${st}"><span class="ci">${c.busy ? '' : c.ok ? '✓' : c.required ? '!' : '–'}</span>
-      <span class="ct"><b>${esc(c.name)}${c.required ? '' : '<em>optional</em>'}</b><small>${esc(c.detail)}</small></span>${btn}</div>`;
-  }).join('');
-  $('chkList').querySelectorAll('button[data-what]').forEach(b => b.onclick = async () => {
-    const what = b.dataset.what;
-    b.disabled = true;
-    const r = await post('/api/setup?what=' + encodeURIComponent(what));
-    $('chkNote').hidden = false;
-    $('chkNote').textContent = r.ok ? ACTION_NOTE[what] || 'Working…' : 'Couldn\'t start that: ' + (r.error || 'failed');
-    watchHealth();
-  });
-  $('chkTitle').textContent = health.ready ? 'You\'re all set' : 'Getting CAD Parts ready';
-  $('chkDone').textContent = health.ready ? 'Done' : 'Continue anyway';
-}
-function watchHealth() { // after an install / sign-in: re-check every few seconds for a while
-  clearInterval(healthPoll);
-  let n = 0;
-  healthPoll = setInterval(async () => {
-    if ($('checks').hidden || ++n > 100) { clearInterval(healthPoll); return; }
-    const before = health && health.ready;
-    await fetchHealth(true); renderChecks();
-    if (health && health.ready && !before) { $('chkNote').hidden = false; $('chkNote').textContent = 'Everything CAD Parts needs is ready.'; }
-  }, 3000);
-}
-async function openChecks() {
-  closePanels();
-  $('checks').hidden = false; $('chkNote').hidden = true;
-  if (!health) $('chkList').innerHTML = '<div class="citem busy"><span class="ci"></span><span class="ct"><b>Checking this PC…</b></span></div>';
-  else renderChecks();
-  await fetchHealth(true); renderChecks();
-  if (health && health.checks.some(c => c.busy)) watchHealth();
-}
-$('chkAgain').onclick = async () => { $('chkAgain').disabled = true; await fetchHealth(true); renderChecks(); $('chkAgain').disabled = false; };
-$('chkDone').onclick = () => { $('checks').hidden = true; clearInterval(healthPoll); };
-$('sHealth').onclick = () => openChecks();
+
 
 // ---------- version + update check (the server asks GitHub for the latest release, at most every 6 hours) ----------
 (async () => {
@@ -1931,9 +1971,9 @@ $('sHealth').onclick = () => openChecks();
     toast(`CAD Parts ${v.latest} is available`, { action: 'Get it', ms: 12000, onAction: () => post('/api/setup?what=update') });
   }
 })();
-// on start: check quietly; open the checklist only if something required is missing (a CAD engine that's
-// still warming up doesn't count: on this PC that just takes a few seconds after the server starts)
-fetchHealth(false).then(h => { if (h && h.checks.some(c => c.required && !c.ok && !c.busy)) openChecks(); });
+$('sHealth').onclick = () => openChecks();
+// a PC that passed the checks before: check again quietly in the background, and only speak up if something broke
+if (checkedOnStart === false) fetchHealth(false).then(h => { if (h && !coreReady()) { localStorage.removeItem('cad-setup-ok'); openChecks(); } });
 
 // ---------- profile button (top right) ----------
 $('bProf').hidden = false;
@@ -1972,7 +2012,7 @@ function closePanels() { // anything open on top? close it and say so
   if (!$('pmenu').hidden) { $('pmenu').hidden = true; any = true; }
   if (!$('profMenu').hidden) { $('profMenu').hidden = true; $('bProf').classList.remove('on'); any = true; }
   if (!$('setup').hidden && !$('pfCancel').hidden) { $('setup').hidden = true; any = true; }
-  if (!$('checks').hidden) { $('checks').hidden = true; clearInterval(healthPoll); any = true; }
+  if (!$('checks').hidden) { closeChecks(); any = true; }
   const lb = document.querySelector('.lightbox'); if (lb) { lb.remove(); any = true; }
   return any;
 }

@@ -12,6 +12,16 @@ import os
 import re
 import shutil
 import subprocess
+
+if os.name == "nt":  # helpers the server starts (Claude Code, PowerShell, uv…) never pop up a console window,
+    _Popen_init = subprocess.Popen.__init__  # even when the server itself was started without a console.
+
+    def _no_window_init(self, *args, creationflags=0, **kwargs):
+        if not creationflags:
+            creationflags = subprocess.CREATE_NO_WINDOW
+        _Popen_init(self, *args, creationflags=creationflags, **kwargs)
+
+    subprocess.Popen.__init__ = _no_window_init
 import sys
 import struct
 import threading

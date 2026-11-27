@@ -33,7 +33,7 @@ def ensure_worker() -> None:
         return
     except OSError:
         pass
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # hidden console (not detached: then its children would pop up windows)
     subprocess.Popen(["uv", "run", "--python", "3.12", "--with", "build123d", "python", str(HERE / "cadworker.py")],
                      cwd=str(HERE), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      creationflags=flags)

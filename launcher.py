@@ -65,7 +65,7 @@ def start_server():
     SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
     log = open(SERVER_LOG, "w", encoding="utf-8", errors="replace")
     return subprocess.Popen([uv, "run", "--python", "3.12", "python", "server.py"], cwd=str(APP_DIR),
-                            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                            creationflags=subprocess.CREATE_NO_WINDOW,  # hidden console: everything the server starts shares it (no pop-up windows)
                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
 
 
