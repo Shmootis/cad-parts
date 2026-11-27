@@ -1,0 +1,7 @@
+# built files (the installer goes on GitHub Releases, not in the repo)
+dist/
+*.exe
+__pycache__/
+*.pyc
+# made at run time
+mcp-none.json
