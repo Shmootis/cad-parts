@@ -52,8 +52,13 @@ def load(path):
 
     before = set(bpy.data.objects)
     win = bpy.context.window_manager.windows[0]
-    with bpy.context.temp_override(window=win):
-        bpy.ops.wm.stl_import(filepath=path)
+    # wm.stl_import is Blender 3.6+ (and the only one in 4.2+); older versions have import_mesh.stl
+    op = bpy.ops.wm.stl_import if bpy.app.version >= (3, 6, 0) else bpy.ops.import_mesh.stl
+    if hasattr(bpy.context, "temp_override"):  # Blender 3.2+
+        with bpy.context.temp_override(window=win):
+            op(filepath=path)
+    else:
+        op({"window": win}, filepath=path)
     for obj in set(bpy.data.objects) - before:
         obj["viewer"] = True
 

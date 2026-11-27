@@ -20,45 +20,58 @@ PORT = 8766
 HERE = Path(__file__).resolve().parent
 
 
-def call(req: dict, timeout: float = 600) -> dict:
-    with socket.create_connection(("127.0.0.1", PORT), timeout=timeout) as s:
+def call(req: dict, timeout: float | None = None) -> dict:
+    """One request. No timeout by default: the worker answers in order, so a request queued behind a
+    long build simply waits for it (the worker binds its port before loading, so it is never "missing")."""
+    with socket.create_connection(("127.0.0.1", PORT), timeout=10) as s:
+        s.settimeout(timeout)
         s.sendall((json.dumps(req) + "\n").encode())
         f = s.makefile("rb")
         return json.loads(f.readline() or b"{}")
 
 
-def ensure_worker() -> None:
+def port_taken() -> bool:
+    """A worker owns the port (loading build123d, busy with a build, or idle). Plain TCP connect, no request."""
     try:
-        call({"ping": True}, timeout=2)
-        return
+        with socket.create_connection(("127.0.0.1", PORT), timeout=2):
+            return True
     except OSError:
-        pass
+        return False
+
+
+def ensure_worker() -> None:
+    if port_taken():
+        return
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # hidden console (not detached: then its children would pop up windows)
     subprocess.Popen(["uv", "run", "--python", "3.12", "--with", "build123d", "python", str(HERE / "cadworker.py")],
                      cwd=str(HERE), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      creationflags=flags)
-    deadline = time.time() + 180
+    deadline = time.time() + 900  # the first start may download Python and build123d before the worker can bind
     while time.time() < deadline:
         time.sleep(0.5)
-        try:
-            call({"ping": True}, timeout=2)
+        if port_taken():
             return
-        except OSError:
-            continue
     sys.exit("cadworker did not start (try: uv run --python 3.12 --with build123d python cadworker.py, in the app folder)")
 
 
 def main() -> None:
     if len(sys.argv) < 2:
         sys.exit(__doc__)
-    if sys.argv[1] == "--warm":  # just make sure the worker is up (used by the dashboard at startup)
+    if sys.argv[1] == "--warm":  # make sure the worker is up and build123d is loaded (used by the dashboard at startup)
         ensure_worker()
-        return
+        try:
+            res = call({"ping": True})  # answered once build123d is loaded (and any queued build is done)
+        except OSError as e:
+            sys.exit(f"cadworker stopped while starting: {e}")
+        sys.exit(0 if res.get("pong") else "cadworker did not answer")
     script = str(Path(sys.argv[1]).resolve())
     if not os.path.isfile(script):
         sys.exit(f"no such script: {script}")
     ensure_worker()
-    res = call({"script": script, "args": sys.argv[2:], "cwd": os.getcwd()})
+    try:
+        res = call({"script": script, "args": sys.argv[2:], "cwd": os.getcwd()})
+    except (OSError, ValueError) as e:
+        sys.exit(f"the build123d worker stopped before answering ({e}); run the script again")
     if res.get("out"):
         sys.stdout.write(res["out"])
     if res.get("err"):

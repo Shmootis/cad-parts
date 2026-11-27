@@ -28,8 +28,21 @@ You choose where parts are kept: a OneDrive folder (synced across your PCs), a f
 
 ## Building from source
 
-- `build-exe.cmd`: builds `CAD Parts.exe` (the app window) with PyInstaller.
-- `build-release.ps1`: builds the app window and then the installer (`dist\`), using [Inno Setup 6](https://jrsoftware.org/isinfo.php).
+- `build-exe.cmd`: builds `CAD Parts.exe` (the app window) with PyInstaller (pinned pywebview / PyInstaller versions).
+- `build-release.ps1`: runs `checks.py` (stops if anything fails), then builds the app window and the installer (`dist\`), using [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 - The version number lives in `version.json`.
+
+### Checks
+
+`uv run --python 3.12 python checks.py` starts the real server on a free port with a throwaway parts folder and profiles file, drives it over HTTP like the app does, and prints PASS/FAIL per check (exit code 1 on any failure). Run it before every release; `build-release.ps1` does this for you.
+
+### Without the app window
+
+- `Start CAD Parts.cmd`: starts the server in the background (if it isn't running) and opens the dashboard in your browser, at `http://127.0.0.1:8765/?k=<key>` with the launch key the server writes to `%LOCALAPPDATA%\CAD Parts\server.key`.
+- `Stop CAD Parts.cmd`: stops the server (port 8765) and the build123d worker (port 8766).
+
+### Running part scripts fast
+
+`uv run --python 3.12 <app folder>/run.py <part>/<part>_vN.py [args]` runs a build123d script like `python script.py`, but on a warm worker (`cadworker.py`, port 8766) that has build123d already loaded: about 0.4 s instead of about 11 s. The first run starts the worker. Runs are handled one at a time; a run started during a long build waits for it.
 
 Bundled: [three.js](https://threejs.org) 0.170 (MIT) in `vendor/three`.

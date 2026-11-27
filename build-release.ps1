@@ -6,6 +6,10 @@ Set-Location -LiteralPath $PSScriptRoot
 $version = (Get-Content -Raw version.json | ConvertFrom-Json).version
 Write-Host "CAD Parts $version"
 
+# the app's self-checks first: never build a release that fails them
+& uv run --python 3.12 python checks.py
+if ($LASTEXITCODE) { throw "checks.py failed: fix it before building a release" }
+
 & cmd /c "`"$PSScriptRoot\build-exe.cmd`""
 if ($LASTEXITCODE) { throw "building CAD Parts.exe failed" }
 Remove-Item -ErrorAction SilentlyContinue 'CAD Parts.old.exe'

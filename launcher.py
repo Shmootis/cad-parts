@@ -13,30 +13,109 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
+from ctypes import wintypes
 from pathlib import Path
 
 URL = "http://127.0.0.1:8765"
 TITLE = "CAD Parts"
+EXE_NAME = Path(sys.executable).name.lower()  # "cad parts.exe" (onefile: bootloader and its child share it)
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
 else:
     APP_DIR = Path(__file__).resolve().parent
-if not (APP_DIR / "server.py").is_file():  # exe copied somewhere else: fall back to the project
-    APP_DIR = Path.home() / "OneDrive" / "cad-parts-app"
+if not (APP_DIR / "server.py").is_file():  # exe copied somewhere else: the developer's project, if this PC has it
+    _dev = Path.home() / "OneDrive" / "cad-parts-app"
+    if (_dev / "server.py").is_file():
+        APP_DIR = _dev
+HAVE_SERVER = (APP_DIR / "server.py").is_file()
 
-LOCAL = Path.home() / "AppData" / "Local" / "CAD Parts"
+LOCAL = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "CAD Parts"
 STORAGE = LOCAL / "webview"         # the page's own storage (layout choices etc.)
 WINDOW_FILE = LOCAL / "window.json"  # size / position / maximized, per PC
+KEY_FILE = LOCAL / "server.key"     # written by server.py at start-up; GET / needs ?k=<key>
+
+# local requests must never go through the system proxy
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+kernel32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                ctypes.POINTER(wintypes.DWORD))
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user32.EnumWindows.argtypes = (_WNDENUMPROC, wintypes.LPARAM)
+user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+user32.GetWindow.restype = wintypes.HWND
+user32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+user32.IsZoomed.argtypes = (wintypes.HWND,)
 
 
 def server_up():
     try:
-        with urllib.request.urlopen(URL + "/api/ping", timeout=1) as r:
+        with _LOCAL_OPENER.open(URL + "/api/ping", timeout=1) as r:
             return r.status == 200
     except Exception:
         return False
+
+
+def read_key(seconds=10):
+    """The server's launch key (it writes the file at start-up; give it a moment if it isn't there yet)."""
+    for _ in range(int(seconds * 4)):
+        try:
+            k = KEY_FILE.read_text(encoding="utf-8").strip()
+            if k:
+                return k
+        except OSError:
+            pass
+        time.sleep(0.25)
+    return None
+
+
+def _process_exe(pid):
+    h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf, n = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+        return Path(buf.value).name.lower() if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)) else ""
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def app_windows(own=False):
+    """Visible top-level "CAD Parts" windows that belong to a CAD Parts.exe process (not e.g. an Explorer
+    window on a folder of that name). own=True: only this process's window; otherwise only other processes'."""
+    found = []
+
+    def cb(h, _):
+        if not user32.IsWindowVisible(h) or user32.GetWindow(h, 4):  # GW_OWNER: skip dialogs / owned windows
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(h, buf, 256)
+        if buf.value != TITLE:
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        if own:
+            if pid.value == os.getpid():
+                found.append(h)
+        elif pid.value != os.getpid() and _process_exe(pid.value) == EXE_NAME:
+            found.append(h)
+        return True
+
+    user32.EnumWindows(_WNDENUMPROC(cb), 0)
+    return found
 
 
 LOCAL_BIN = Path.home() / ".local" / "bin"  # where uv's (and Claude Code's) official installers put their programs
@@ -51,12 +130,13 @@ def find_uv():
 def install_uv():
     """First run on a new PC: uv runs the app's Python. Astral's official installer, no admin rights needed."""
     subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-                    "irm https://astral.sh/uv/install.ps1 | iex"],
+                    # pinned installer version (not "latest"): what gets run is fixed; uv can update itself later
+                    "irm https://astral.sh/uv/0.13.9/install.ps1 | iex"],
                    creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, timeout=600)
     return find_uv()
 
 
-SERVER_LOG = Path.home() / "AppData" / "Local" / "CAD Parts" / "server.log"  # what the server printed (for "why won't it start")
+SERVER_LOG = LOCAL / "server.log"  # what the server printed (for "why won't it start")
 
 
 def start_server():
@@ -94,7 +174,12 @@ class Api:
         """When the server isn't answering."""
         if not server_up():
             start_server()
-        return wait_for_server(60)
+        if not wait_for_server(60):
+            return False
+        key = read_key()  # a new server has a new launch key: reopen the page with it
+        if key and self._win:
+            self._win.load_url(URL + "/?k=" + urllib.parse.quote(key, safe=""))
+        return bool(key)
 
     def pick_folder(self, start=""):
         """Windows' folder picker, shown by the app window itself: opens at once and always in front of it."""
@@ -129,11 +214,9 @@ class Api:
 
 def focus_existing():
     """Second launch: bring the open window to the front instead of opening another one."""
-    u = ctypes.windll.user32
-    h = u.FindWindowW(None, TITLE)
-    if h:
-        u.ShowWindow(h, 9)  # SW_RESTORE
-        u.SetForegroundWindow(h)
+    for h in app_windows()[:1]:
+        user32.ShowWindow(h, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(h)
 
 
 def load_geometry():
@@ -163,8 +246,11 @@ stroke="#fff" stroke-width="1.8" stroke-linejoin="round"><path d="M12 2.8 20 7.4
 
 
 def main():
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\CADPartsWindow")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    # held while the window is open (closed after webview.start returns, or by Windows at exit). The installer's
+    # AppMutex checks it to ask the user to close CAD Parts before an update.
+    mutex = kernel32.CreateMutexW(None, False, "Local\\CADPartsWindow")
+    if mutex and ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(mutex)
         focus_existing()
         return
 
@@ -179,7 +265,21 @@ def main():
         win.evaluate_js("document.getElementById('m').textContent=" + json.dumps(text))
 
     def boot(win):
+        try:
+            _boot(win)
+        except Exception as ex:  # never leave the window on "Starting CAD Parts…" forever
+            try:
+                say(f"CAD Parts couldn't start: {ex!r}"[:300]
+                    + " Close this window and open CAD Parts again; if it keeps happening, send this message.")
+            except Exception:
+                pass
+
+    def _boot(win):
         if not server_up():
+            if not HAVE_SERVER:
+                say("CAD Parts couldn't start: its files (server.py) aren't next to CAD Parts.exe (" + str(APP_DIR)
+                    + "). Reinstall CAD Parts, or open it from the folder it was installed to.")
+                return
             if not find_uv():
                 say("Installing uv (one time, about a minute)…")
                 if not install_uv():
@@ -206,7 +306,12 @@ def main():
                 say("CAD Parts' server is taking very long to start. " + (log_tail() or "")
                     + " Check your internet connection, then close this window and open CAD Parts again.")
                 return
-        win.load_url(URL)
+        key = read_key()
+        if not key:
+            say("CAD Parts couldn't start: its server is running but didn't leave its launch key ("
+                + str(KEY_FILE) + "). Close this window and open CAD Parts again; if it keeps happening, send this message.")
+            return
+        win.load_url(URL + "/?k=" + urllib.parse.quote(key, safe=""))
 
     api = Api()
     win = webview.create_window(TITLE, html=LOADING, width=g["width"], height=g["height"], **pos,
@@ -230,9 +335,9 @@ def main():
         state["maximized"] = False
 
     def on_closing():
-        h = ctypes.windll.user32.FindWindowW(None, TITLE)
-        if h:  # the real answer, whatever the events said (restoring from minimized also fires "restored")
-            state["maximized"] = bool(ctypes.windll.user32.IsZoomed(h))
+        own = app_windows(own=True)  # this process's own window, never another one with the same title
+        if own:  # the real answer, whatever the events said (restoring from minimized also fires "restored")
+            state["maximized"] = bool(user32.IsZoomed(own[0]))
         try:
             WINDOW_FILE.write_text(json.dumps(state), encoding="utf-8")
         except OSError:
@@ -245,7 +350,7 @@ def main():
     win.events.closing += on_closing
     webview.start(boot, win, private_mode=False, storage_path=str(STORAGE),
                   icon=str(APP_DIR / "cadparts.ico"))
-    del mutex
+    kernel32.CloseHandle(mutex)  # the window is closed: a new launch may start now
 
 
 if __name__ == "__main__":

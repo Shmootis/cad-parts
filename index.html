@@ -22,7 +22,6 @@
   </div>
   <button id="bNew" class="newbtn">+ New Part</button>
   <div class="spacer"></div>
-  <button id="bSet" class="trashbtn" title="Settings and keyboard shortcuts" aria-haspopup="dialog" hidden><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>Settings</button>
   <div id="settings" class="trashpanel" role="dialog" aria-label="Settings" hidden>
     <div class="trashhead"><b>Settings</b><span class="spacer"></span><button id="setClose" class="ghost" aria-label="Close">✕</button></div>
     <div class="setbody">
@@ -39,10 +38,10 @@
       <div class="setrow"><span>CAD Parts Version<small id="sVersion">…</small></span><button id="sUpdate" type="button" class="primary" hidden>Get Update</button></div>
       <label class="setrow"><span>Build Finished Notifications<small>When the app is in the background</small></span><input id="sNotify" type="checkbox"></label>
       <div class="keys"><b>Keyboard Shortcuts</b><div class="kgrid">
-        <kbd>N</kbd><span>New Part</span>
+        <kbd>N / Ctrl+N</kbd><span>New Part</span>
         <kbd>E</kbd><span>Edit Part / Back to Parts</span>
         <kbd>/</kbd><span>Search</span>
-        <kbd>↑ ↓</kbd><span>Previous / Next Part</span>
+        <kbd>↑ ↓ ← →</kbd><span>Previous / Next Part</span>
         <kbd>F</kbd><span>Favorite</span>
         <kbd>F2</kbd><span>Rename</span>
         <kbd>D</kbd><span>Duplicate</span>
@@ -52,10 +51,6 @@
       </div></div>
     </div>
   </div>
-  <button id="bTrash" class="trashbtn" title="Recycle Bin" aria-haspopup="dialog" hidden>
-    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13M10 11v6M14 11v6"/></svg>
-    Recycle Bin
-  </button>
   <button id="bProf" class="avatar" title="Profile" aria-haspopup="menu" hidden></button>
   <div id="profMenu" class="menu" role="menu" hidden></div>
   <div id="trash" class="trashpanel" role="dialog" aria-label="Recycle Bin" hidden>
@@ -75,7 +70,6 @@
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>Parts</button>
       <span class="dtitle"><h2 id="dName"></h2><button id="dRename" class="renamebtn" type="button" title="Rename"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg></button></span><div id="dChips" class="chips"></div>
       <span class="spacer"></span>
-      <button id="dFav" class="ghost iconbtn" title="Favorite" hidden>☆</button>
       <button id="bSlicer" class="owbtn slbtn" type="button" hidden></button>
       <div class="owdd" id="owWrap"><button id="bOpenWith" class="owbtn" type="button" aria-haspopup="menu">Open With<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
           <div id="owMenu" class="menu owmenu" role="menu" hidden></div></div>
@@ -102,7 +96,7 @@
   </aside>
   <div id="split" class="splitter" role="separator" aria-orientation="vertical"></div>
   <aside id="tabEdit" class="chatbox">
-    <div class="chead sub"><span id="eTitle" class="etitle"></span><span class="spacer"></span><button id="eNew" class="ghost">Clear Chat</button></div>
+    <div class="chead sub"><span class="spacer"></span><button id="eNew" class="ghost">Clear Chat</button></div>
     <div id="emsgs" class="cmsgs"></div>
     <form id="eform" class="cform">
       <div id="eAtts" class="atts" hidden></div>
@@ -158,6 +152,7 @@
       <button type="button" id="stUse" class="primary">Use These</button>
       <button type="button" id="stNotMine">No, Something Else</button>
     </div>
+    <div id="stFail" class="stbtns" hidden><button type="button" id="stRetry" class="primary">Look Again</button></div>
     <div id="stNew" class="stnew" hidden>
       <label class="field"><span>Your Name</span><input id="stName" maxlength="40" placeholder="e.g. Alex" autocomplete="off"></label>
       <button type="button" id="stFresh" class="primary stbig">Start Fresh</button>

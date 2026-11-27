@@ -44,6 +44,8 @@ def main() -> int:
     (root / server.META).mkdir()
     server.APP_DATA = tmp / "appdata"
     server.PROFILES_FILE = server.APP_DATA / "profiles.json"
+    server.KEY_FILE = tmp / "local" / "server.key"  # never the real launch key
+    server.init_key()
     server.ROOT = root
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -72,8 +74,18 @@ def main() -> int:
 
     try:
         # --- the page and its files
+        check(server.KEY_FILE.read_text().strip() == server.KEY, "the launch key is written for the launcher")
         code, page = call("GET", "/", token=False)
-        check(code == 200 and server.TOKEN.encode() in page and b"__CAD_TOKEN__" not in page, "page is served with this run's key")
+        check(code == 403 and server.TOKEN.encode() not in page, "page without the launch key is refused")
+        check(call("GET", "/?k=wrong", token=False)[0] == 403, "page with a wrong launch key is refused")
+        req = urllib.request.Request(base + "/?k=" + urllib.request.quote(server.KEY))
+        with urllib.request.urlopen(req, timeout=30) as r:
+            page, set_cookie = r.read(), r.headers.get("Set-Cookie", "")
+        check(server.TOKEN.encode() in page and b"__CAD_TOKEN__" not in page, "page is served with the launch key")
+        check(f"cadk={server.KEY}" in set_cookie and "HttpOnly" in set_cookie and "SameSite=Strict" in set_cookie,
+              "…and remembers it in a cookie", set_cookie)
+        code, page = call("GET", "/", token=False, headers={"Cookie": f"cadk={server.KEY}"})
+        check(code == 200 and server.TOKEN.encode() in page, "the cookie opens the page (reload)")
         check(call("GET", "/app.js", token=False)[0] == 200 and call("GET", "/app.css", token=False)[0] == 200, "app.js and app.css are served")
 
         # --- security: other web pages can't use the server
@@ -91,8 +103,20 @@ def main() -> int:
         check(cube_versions == [1, 2], "versions are read in order", cube_versions)
 
         # --- rename, duplicate, favorite, category
+        (root / "cube" / "notes.md").write_text("cube_v2 is rounded; cubes, cube-holder and cupboard stay", encoding="utf-8")
+        server.update_state(lambda st: st.update(kept=["cube/cube_v1.stl", "hook/hook_v1.stl"]))
         code, r = call("POST", "/api/rename?path=cube&to=Block")
         check(r.get("ok") and (root / "block").is_dir() and not (root / "cube").exists(), "rename a part", r)
+        notes = (root / "block" / "notes.md").read_text(encoding="utf-8")
+        check(notes == "block_v2 is rounded; cubes, cube-holder and cupboard stay", "rename changes whole names only", notes)
+        check(server.load_state()["kept"] == ["block/block_v1.stl", "hook/hook_v1.stl"], "kept versions follow the rename",
+              server.load_state()["kept"])
+        (root / "Mixed").mkdir()
+        (root / "Mixed" / "Mixed_v1.stl").write_bytes(STL)
+        code, r = call("POST", "/api/rename?path=Mixed&to=mixed")
+        check(r.get("ok") and [d.name for d in root.iterdir() if d.name.lower() == "mixed"] == ["mixed"]
+              and (root / "mixed" / "mixed_v1.stl").is_file(), "a capitals-only rename works", r)
+        shutil.rmtree(root / "mixed")
         code, r = call("POST", "/api/duplicate?path=block")
         dup = r.get("name", "")
         check(r.get("ok") and (root / dup).is_dir(), "duplicate a part", r)
@@ -126,9 +150,42 @@ def main() -> int:
             code, r = call("POST", "/api/restore?id=" + urllib.request.quote(items[0]["id"]))
             check(r.get("ok") and target.exists(), "restore it", r)
 
+        # --- PowerShell quoting: Windows' curly quotes end a '...' string too
+        tricky = "it’s ‘odd’ ‚x‛ 'y' $z"
+        out = server._ps("Write-Output " + server._ps_lit(tricky)) or ""
+        check(out.strip() == tricky, "PowerShell quoting is safe (’ ‘ ‚ ‛ quotes)", out)
+        check(server.safe_path("hook/a%41.stl").name == "a%41.stl", "a % in a file name isn't decoded twice")
+        quirky = root / "o’brien"
+        quirky.mkdir()
+        (quirky / "o’brien_v1.stl").write_bytes(STL)
+        code, r = call("POST", "/api/delete?path=" + urllib.request.quote("o’brien/o’brien_v1.stl"))
+        check(r.get("ok") and not (quirky / "o’brien_v1.stl").exists(), "delete a file whose folder has a ’ in its name", r)
+        items = []
+        for _ in range(10):
+            items = [it for it in call("GET", "/api/trash")[1].get("items", []) if it.get("name") == "o’brien_v1.stl"]
+            if items:
+                break
+            time.sleep(0.5)
+        check(items and items[0].get("part") == "o’brien", "…it shows in the Recycle Bin", items)
+        if items:
+            code, r = call("POST", "/api/restore?id=" + urllib.request.quote(items[0]["id"]))
+            check(r.get("ok") and (quirky / "o’brien_v1.stl").exists(), "…and comes back", r)
+        shutil.rmtree(quirky)
+        # the merged sync copy (in the Recycle Bin, from <tmp>\parts\.cadparts) isn't listed for a folder <tmp>\part
+        listed = [it for it in server.trash_list() if it.get("name") == "state-LAPTOP.json"]
+        server.ROOT = Path(str(root)[:-1])
+        sibling = [it for it in server.trash_list() if it.get("name") == "state-LAPTOP.json"]
+        server.ROOT = root
+        check(listed and not sibling, "a folder whose name only starts the same doesn't share the Recycle Bin list")
+
         # --- version info answers (offline is fine)
         code, v = call("GET", "/api/version")
         check(code == 200 and v.get("version") == server.APP_VERSION, "version info")
+        keys = {"version", "latest", "url", "newer", "job", "ready", "downloading", "download_failed"}
+        real_repo = server.UPDATE_REPO
+        server.UPDATE_REPO = ""
+        check(set(server.update_info()) == keys and set(v) == keys, "version info always has the same fields", sorted(v))
+        server.UPDATE_REPO = real_repo or "example/none"
 
         # --- your Claude account owns this folder; a new PC finds it after signing in
         server._account["id"] = "test-account"
@@ -211,8 +268,22 @@ def main() -> int:
         with zipfile.ZipFile(evil, "w") as z:
             z.writestr(server.EXPORT_MANIFEST, "{}")
             z.writestr("../escaped.txt", "x")
-        server.import_parts(str(evil), tmp / "evil-target")
+        target_dir = tmp / "evil-target"
+        target_dir.mkdir()
+        (target_dir / "CLAUDE.md").write_text("mine")
+        absolute = "/" + str(tmp / "abs-escaped.txt")[3:].replace("\\", "/")  # C:\…\abs-escaped.txt without "C:"
+        with zipfile.ZipFile(evil, "a") as z:
+            z.writestr(absolute, "x")
+            z.writestr(".claude/settings.json", "{}")
+            z.writestr("CLAUDE.md", "theirs")
+            z.writestr("README.md", "new notes")
+        server.import_parts(str(evil), target_dir)
         check(not (tmp / "escaped.txt").exists(), "a file can't write outside the folder")
+        check(not (tmp / "abs-escaped.txt").exists() and not (target_dir / "abs-escaped.txt").exists(),
+              "an absolute path in the file is ignored")
+        check(not (target_dir / ".claude").exists(), "nothing is written into .claude")
+        check((target_dir / "CLAUDE.md").read_text() == "mine" and (target_dir / "README.md").read_text() == "new notes",
+              "an existing CLAUDE.md isn't overwritten (new notes are added)")
 
         # --- updates: a newer release downloads quietly, is checked, and is then "ready" (nothing is installed here)
         import hashlib

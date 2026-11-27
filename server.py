@@ -1,7 +1,7 @@
 """CAD Parts dashboard: a tiny local server for the cad-parts folder.
 
 Run:  uv run --python 3.12 python server.py [--open]
-Then: http://127.0.0.1:8765
+Then: http://127.0.0.1:8765/?k=<the key in %LOCALAPPDATA%\\CAD Parts\\server.key> (--open does this for you)
 
 Standard library only. Binds to 127.0.0.1, so nothing outside this PC can reach it.
 """
@@ -29,7 +29,6 @@ import threading
 import time
 import webbrowser
 import xml.etree.ElementTree as ET
-import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,11 +37,16 @@ from urllib.parse import parse_qs, unquote, urlparse
 PORT = 8765
 APP_DIR = Path(__file__).resolve().parent  # the app's own code (never inside a parts folder)
 ROOT: Path | None = None  # the active profile's parts folder; None until the first-run setup is done
-META = ".cadparts"  # hidden folder inside each parts folder: settings, favorites/tags, new-part chat, pictures
+META = ".cadparts"  # hidden folder inside each parts folder: settings, favorites/categories, new-part chat, pictures
 APP_DATA = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "CAD Parts"
 PROFILES_FILE = APP_DATA / "profiles.json"  # who uses this PC and where their parts are
+LOCAL_DATA = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "CAD Parts"  # this PC only
+# The launch key: only someone who can read this Windows user's own files (the launcher, Start CAD Parts.cmd) can
+# open the page, so another Windows user or a local web page can't get the API token from it. New every start.
+KEY_FILE = LOCAL_DATA / "server.key"
+KEY = ""
 SHOW_PS1 = APP_DIR / "blender" / "show.ps1"  # one reused Blender window (viewer.py watches a trigger file)
-VIEWER_STATE = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "CAD Parts" / "blender"
+VIEWER_STATE = LOCAL_DATA / "blender"
 LOCAL_BIN = Path.home() / ".local" / "bin"  # where the uv and Claude Code installers put their programs
 if str(LOCAL_BIN).lower() not in os.environ.get("PATH", "").lower():  # freshly installed tools work without a re-login
     os.environ["PATH"] = str(LOCAL_BIN) + os.pathsep + os.environ.get("PATH", "")
@@ -135,9 +139,15 @@ def _apps_state() -> dict:
 def _save_apps_state(st: dict) -> None:
     APP_DATA.mkdir(parents=True, exist_ok=True)
     APPS_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    _apps_cache["t"] = 0.0
+
+
+_apps_cache = {"t": 0.0, "v": []}  # globbing Program Files for each <img> icon request adds up
 
 
 def installed_apps() -> list[dict]:
+    if time.time() - _apps_cache["t"] < 15:
+        return _apps_cache["v"]
     out = []
     for aid, name, kind, pats in KNOWN_APPS:
         exe = find_blender() if aid == "blender" else _find_pattern(pats)
@@ -146,6 +156,7 @@ def installed_apps() -> list[dict]:
     for c in _apps_state()["custom"]:
         if Path(c.get("exe", "")).is_file():
             out.append({"id": c["id"], "name": c["name"], "kind": c.get("kind") or "other", "exe": c["exe"], "custom": True})
+    _apps_cache.update(t=time.time(), v=out)
     return out
 
 
@@ -186,19 +197,25 @@ def open_with(app_id: str, rel: str) -> dict:
     if app_id == "blender":  # one reused Blender window (viewer.py watches a trigger file)
         if p.suffix.lower() != ".stl":
             return {"ok": False, "error": "Blender opens STL files"}
-        VIEWER_STATE.mkdir(parents=True, exist_ok=True)
-        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SHOW_PS1),
-                            "-Path", str(p), "-Blender", app["exe"], "-State", str(VIEWER_STATE)],
-                           capture_output=True, text=True, timeout=30)
+        try:
+            VIEWER_STATE.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SHOW_PS1),
+                                "-Path", str(p), "-Blender", app["exe"], "-State", str(VIEWER_STATE)],
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return {"ok": False, "error": f"Blender didn't open ({e})"[:200]}
         return {"ok": r.returncode == 0, "error": "" if r.returncode == 0 else (r.stderr or r.stdout).strip()[-200:]}
     # Bambu Studio: its own "single instance" setting decides whether an open window is reused.
     # Don't pass --single-instance: some builds exit with -2 on it.
-    subprocess.Popen([app["exe"], str(p)], cwd=str(Path(app["exe"]).parent),
-                     creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    try:
+        subprocess.Popen([app["exe"], str(p)], cwd=str(Path(app["exe"]).parent),
+                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    except OSError as e:
+        return {"ok": False, "error": f"{app['name']} didn't start ({e.strerror or e})"}
     return {"ok": True, "name": app["name"]}
 
 
-ICON_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "CAD Parts" / "icons"
+ICON_DIR = LOCAL_DATA / "icons"
 EXPLORER = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "explorer.exe")
 
 
@@ -209,19 +226,19 @@ def app_icon(app_id: str) -> bytes | None:
     else:
         app = next((a for a in installed_apps() if a["id"] == app_id), None)
         exe = app and app["exe"]
-    if not exe or not Path(exe).is_file():
-        return None
-    ICON_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = int(Path(exe).stat().st_mtime)
-    out = ICON_DIR / f"{re.sub(r'[^a-zA-Z0-9_-]', '_', app_id)}-{stamp}.png"
-    if not out.is_file():
-        ps = ("Add-Type -AssemblyName System.Drawing; "
-              f"$i = [System.Drawing.Icon]::ExtractAssociatedIcon({_ps_lit(exe)}); "
-              f"if ($i) {{ $i.ToBitmap().Save({_ps_lit(str(out))}, [System.Drawing.Imaging.ImageFormat]::Png) }}")
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=30)
     try:
+        if not exe or not Path(exe).is_file():
+            return None
+        stamp = int(Path(exe).stat().st_mtime)
+        out = ICON_DIR / f"{re.sub(r'[^a-zA-Z0-9_-]', '_', app_id)}-{stamp}.png"
+        if not out.is_file():
+            ICON_DIR.mkdir(parents=True, exist_ok=True)
+            ps = ("Add-Type -AssemblyName System.Drawing; "
+                  f"$i = [System.Drawing.Icon]::ExtractAssociatedIcon({_ps_lit(exe)}); "
+                  f"if ($i) {{ $i.ToBitmap().Save({_ps_lit(str(out))}, [System.Drawing.Imaging.ImageFormat]::Png) }}")
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=30)
         return out.read_bytes()
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
 
 
@@ -229,7 +246,10 @@ def show_in_folder(rel: str) -> dict:
     p = safe_path(rel)
     if not p or not p.exists():
         return {"ok": False, "error": "not found"}
-    subprocess.Popen([EXPLORER, "/select,", str(p)] if p.is_file() else [EXPLORER, str(p)])
+    try:
+        subprocess.Popen([EXPLORER, "/select,", str(p)] if p.is_file() else [EXPLORER, str(p)])
+    except OSError as e:
+        return {"ok": False, "error": f"File Explorer didn't open ({e.strerror or e})"}
     return {"ok": True, "name": "File Explorer"}
 
 
@@ -240,7 +260,10 @@ def pick_app() -> dict:
           "$f.InitialDirectory = $env:ProgramFiles;"
           "$o = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false};"
           "if ($f.ShowDialog($o) -eq 'OK') { $f.FileName; (Get-Item -LiteralPath $f.FileName).VersionInfo.ProductName }")
-    r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], capture_output=True, text=True, timeout=600)
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"ok": False, "cancelled": True}
     lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
     if not lines or not lines[0].lower().endswith(".exe"):
         return {"ok": False, "cancelled": True}
@@ -256,7 +279,7 @@ def pick_app() -> dict:
 
 
 def find_bambu() -> str | None:
-    return _first(pf / "Bambu Studio" / "bambu-studio.exe" for pf in PROGRAM_FILES)
+    return _find_pattern(next(p for aid, _, _, p in KNOWN_APPS if aid == "bambu"))  # same places as Open with
 
 
 _worker = {"state": "starting", "error": ""}  # the warm build123d worker (first run downloads build123d)
@@ -270,11 +293,13 @@ def warm_worker() -> None:
         return
     try:
         r = subprocess.run([uv, "run", "--python", "3.12", str(APP_DIR / "run.py"), "--warm"], cwd=str(APP_DIR),
-                           capture_output=True, text=True, timeout=1200, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                           capture_output=True, text=True, timeout=1200)
         ok = r.returncode == 0
         _worker.update(state="ready" if ok else "failed", error="" if ok else ((r.stderr or r.stdout or "").strip()[-300:]))
     except subprocess.TimeoutExpired:
         _worker.update(state="failed", error="took too long (slow download?)")
+    except Exception as e:  # noqa: BLE001 - otherwise the setup checklist says "starting" forever
+        _worker.update(state="failed", error=str(e)[:300] or type(e).__name__)
 
 
 def worker_up() -> bool:
@@ -295,20 +320,21 @@ def account_id() -> str:
     """Who is signed in to Claude on this PC, as a SHA-256 fingerprint of the account's email: enough to recognise
     the same person's parts folder on another PC, without writing the email itself into a (synced) folder."""
     if not _account["id"]:
-        claude_auth(force=True)
+        claude_auth(force=True)  # rate-limited there: the setup screen polls this while signed out
     return _account["id"]
 
 
 def claude_auth(force: bool = False) -> dict:
-    """{'loggedIn': bool, 'plan': str} from `claude auth status --json` (cached briefly; it takes ~1 s)."""
-    if not force and _auth_cache["v"] is not None and time.time() - _auth_cache["t"] < 20:
+    """{'loggedIn': bool, 'plan': str} from `claude auth status --json` (cached briefly; it takes ~1 s).
+    Even forced checks reuse an answer under 10 s old; _sign_in clears the cache when the answer must be new."""
+    if _auth_cache["v"] is not None and time.time() - _auth_cache["t"] < (10 if force else 20):
         return _auth_cache["v"]
     exe = find_claude()
     v = {"loggedIn": False, "plan": "", "error": ""}
     if exe:
         try:
             r = subprocess.run([exe, "auth", "status", "--json"], capture_output=True, text=True, timeout=30,
-                               encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                               encoding="utf-8", errors="replace")
             d = json.loads(r.stdout or "{}")
             v["loggedIn"] = bool(d.get("loggedIn"))
             email = str(d.get("email") or "").strip().lower() if v["loggedIn"] else ""
@@ -323,13 +349,20 @@ def claude_auth(force: bool = False) -> dict:
     return v
 
 
+_versions: dict[str, tuple[float, str]] = {}  # exe -> (when, version): the setup screen polls health every few s
+
+
 def _version(exe: str) -> str:
+    hit = _versions.get(exe)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
     try:
-        r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=20,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return (r.stdout or "").strip().split(" (")[0][:30]
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=20)
+        v = (r.stdout or "").strip().split(" (")[0][:30]
     except (OSError, subprocess.TimeoutExpired):
-        return ""
+        v = ""
+    _versions[exe] = (time.time(), v)
+    return v
 
 
 def health(force: bool = False) -> dict:
@@ -357,7 +390,7 @@ def health(force: bool = False) -> dict:
          "detail": "Found" if bambu else "Optional: for the Open in Bambu Studio button", "action": "download"},
     ]
     return {"checks": checks, "ready": all(c["ok"] for c in checks if c["required"]),
-            "tools": {"blender": bool(blender), "bambu": bool(bambu)}, "jobs": {k: dict(v) for k, v in _jobs.items()}}
+            "tools": {"blender": bool(blender), "bambu": bool(bambu)}, "jobs": {k: dict(v) for k, v in list(_jobs.items())}}
 
 
 # ---------------------------------------------------------------- version + update check (GitHub Releases)
@@ -378,9 +411,11 @@ def _vtuple(v: str):
 
 
 def update_info(fresh: bool = False) -> dict:
-    """{'version', 'latest', 'url', 'newer', 'ready', 'job'}. Asks GitHub at most every 6 hours, or every 10 minutes
-    when the app asks for a fresh answer (each time its window opens). Nothing about the user is sent."""
-    info = {"version": APP_VERSION, "latest": None, "url": None, "newer": False}
+    """{'version', 'latest', 'url', 'newer', 'job', 'ready', 'downloading', 'download_failed'} (always all of them).
+    Asks GitHub at most every 6 hours, or every 10 minutes when the app asks for a fresh answer (each time its
+    window opens). Nothing about the user is sent."""
+    info = {"version": APP_VERSION, "latest": None, "url": None, "newer": False,
+            "job": None, "ready": False, "downloading": False, "download_failed": False}
     if not UPDATE_REPO:
         return info
     age = time.time() - _update["t"]
@@ -395,7 +430,9 @@ def update_info(fresh: bool = False) -> dict:
     info["newer"] = bool(info["latest"]) and _vtuple(info["latest"]) > _vtuple(APP_VERSION)
     info["job"] = _jobs.get("update")
     info["ready"] = bool(info["newer"] and _ready["version"] == info["latest"] and _ready["path"] and Path(_ready["path"]).is_file())
-    info["downloading"] = (_jobs.get("update-dl") or {}).get("state") == "running"
+    dl = (_jobs.get("update-dl") or {}).get("state")
+    info["downloading"] = dl == "running"
+    info["download_failed"] = dl == "failed"  # the page stops waiting for "Update Ready"
     return info
 
 
@@ -445,6 +482,11 @@ def _install_update() -> None:
     closes the app window, runs the installer quietly and lets it reopen CAD Parts (installer.iss: /RELAUNCH).
     The installer stops this server itself."""
     _job("update", state="running", step="Getting the update…", pct=None, error="")
+    # the quiet background download may be half-way: wait for it rather than download the same file twice at once
+    t0 = time.time()
+    while (_jobs.get("update-dl") or {}).get("state") == "running" and time.time() - t0 < 3600:
+        _job("update", pct=(_jobs.get("update-dl") or {}).get("pct"))
+        time.sleep(0.5)
     info = update_info()
     ready = info.get("ready")
     dest = Path(_ready["path"]) if ready else _download_update("update")
@@ -464,6 +506,7 @@ def _install_update() -> None:
 
 
 DOWNLOADS = {"blender": "https://www.blender.org/download/", "bambu": "https://bambulab.com/en/download/studio"}
+
 
 # ---------------------------------------------------------------- setup jobs: installs and sign-in, all without windows
 # Each runs in the background; the setup screen polls /api/health and shows progress from _jobs.
@@ -653,7 +696,9 @@ def setup_action(what: str, arg: str = "") -> dict:
     elif what == "build123d":
         threading.Thread(target=warm_worker, daemon=True).start()
     elif what == "update-download":  # quietly, in the background
-        if update_info().get("newer") and not update_info().get("ready") and (_jobs.get("update-dl") or {}).get("state") != "running":
+        info = update_info()
+        busy = any((_jobs.get(j) or {}).get("state") == "running" for j in ("update-dl", "update"))
+        if info["newer"] and not info["ready"] and not busy:
             _jobs.pop("update-dl", None)
             threading.Thread(target=_run_job, args=("update-dl", _prefetch_update), daemon=True).start()
     elif what == "update":
@@ -669,8 +714,29 @@ def setup_action(what: str, arg: str = "") -> dict:
     else:
         return {"ok": False, "error": "unknown"}
     return {"ok": True}
+
+
 TOKEN = secrets.token_urlsafe(24)  # new every time the server starts; see Handler.blocked
 OPEN_GETS = {"/api/ping", "/api/appicon"}  # harmless, and used where no key can be sent (launcher, <img>)
+
+
+def init_key() -> str:
+    """A new launch key (see KEY_FILE), written where only this Windows user can read it."""
+    global KEY
+    KEY = secrets.token_urlsafe(24)
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    KEY_FILE.write_text(KEY, encoding="ascii")
+    return KEY
+
+
+def read_key() -> str:
+    try:
+        return KEY_FILE.read_text(encoding="ascii").strip()
+    except OSError:
+        return ""
+
+
+
 SKIP_DIRS = {"ready-to-print", "_sync", "_app", "_to-review"}
 VERSION_RE = re.compile(r"^(?P<series>.+?)_v(?P<n>\d+)(?:_(?P<desc>.*))?$")
 MODEL_EXT = {".stl", ".3mf"}
@@ -733,33 +799,40 @@ def scan() -> dict:
         return {"setup": True}
     merge_sync_copies()
     st = load_state()
-    complete, favs, tags, cats = set(st["complete"]), set(st["favorites"]), st["tags"], st["categories"]
+    favs, cats = set(st["favorites"]), st["categories"]
     parts = []
-    for d in sorted(ROOT.iterdir(), key=lambda x: x.name.lower()):
-        if not d.is_dir() or d.name.startswith(".") or d.name in SKIP_DIRS:
+    try:
+        dirs = sorted(ROOT.iterdir(), key=lambda x: x.name.lower())
+    except OSError:  # the folder itself went away (drive unplugged, OneDrive moved it)
+        dirs = []
+    # Files and folders can vanish mid-scan (Claude saving, OneDrive syncing, a delete): skip them.
+    for d in dirs:
+        try:
+            if not d.is_dir() or d.name.startswith(".") or d.name in SKIP_DIRS:
+                continue
+            files = list(d.iterdir())
+            d_mtime = d.stat().st_mtime
+        except OSError:
             continue
         models, other, latest = [], [], 0.0
         notes = ""
-        for f in d.iterdir():
-            if not f.is_file():
-                continue
+        for f in files:
             low = f.name.lower()
             if low == CHAT_FILE or low.endswith(".tmp"):  # chat saves don't count as work on the part (keeps date sorting honest)
                 continue
             try:
+                if not f.is_file():
+                    continue
                 mt = f.stat().st_mtime
+                if low == "notes.md":
+                    notes = f.read_text(encoding="utf-8", errors="replace")
+                elif f.suffix.lower() in MODEL_EXT and not low.endswith(".gcode.3mf"):
+                    models.append(parse_model(f))
+                elif f.suffix.lower() != ".py":
+                    other.append(f.name)
             except OSError:
                 continue
             latest = max(latest, mt)
-            if low == "notes.md":
-                try:
-                    notes = f.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    pass
-            elif f.suffix.lower() in MODEL_EXT and not low.endswith(".gcode.3mf"):
-                models.append(parse_model(f))
-            elif f.suffix.lower() != ".py":
-                other.append(f.name)
         series: dict[str, list] = {}
         for mdl in models:
             series.setdefault(mdl["series"], []).append(mdl)
@@ -770,21 +843,18 @@ def scan() -> dict:
         newest = max(tops, key=lambda x: x["mtime"]) if tops else None
         parts.append({
             "name": d.name,
-            "latest": latest or d.stat().st_mtime,
+            "latest": latest or d_mtime,
             "series": [{"name": k, "files": v} for k, v in sorted(series.items())],
             "versions": len({(m["series"], m["version"]) for m in models}),
             "newest": newest,
-            "complete": d.name in complete,
             "fav": d.name in favs,
-            "tags": tags.get(d.name, []),
             "category": cats.get(d.name, ""),
             "other": sorted(other),
             "notes": notes,
             **(notes_fields(notes) or printer_from_files(other, models)),
         })
     sig = (str(sum(p["latest"] for p in parts)) + str(sum(p["versions"] for p in parts)) + str(len(parts))
-           + "|" + ",".join(sorted(complete)) + "|" + ",".join(sorted(favs))
-           + "|" + json.dumps(tags, sort_keys=True) + "|" + json.dumps(cats, sort_keys=True))
+           + "|" + ",".join(sorted(favs)) + "|" + json.dumps(cats, sort_keys=True))
     names = {p["name"] for p in parts}
     categories = sorted({c for n, c in cats.items() if c and n in names}, key=str.lower)
     return {"root": str(ROOT), "parts": parts, "categories": categories, "sig": sig, "now": time.time()}
@@ -812,7 +882,17 @@ def threemf_to_stl(path: Path) -> bytes:
     key = (str(path), path.stat().st_mtime)
     if key in _preview_cache:
         return _preview_cache[key]
-    z = zipfile.ZipFile(path)
+    with zipfile.ZipFile(path) as z:
+        data = _flatten_3mf(z)
+    for k in [k for k in _preview_cache if k[0] == key[0]]:  # an older save of the same file
+        _preview_cache.pop(k, None)
+    while len(_preview_cache) >= 20:  # previews can be MBs each: keep only the recent ones
+        _preview_cache.pop(next(iter(_preview_cache)), None)
+    _preview_cache[key] = data
+    return data
+
+
+def _flatten_3mf(z: zipfile.ZipFile) -> bytes:
     names = {n.lower(): n for n in z.namelist()}
     docs: dict[str, tuple] = {}
 
@@ -857,9 +937,7 @@ def threemf_to_stl(path: Path) -> bytes:
         nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
         ln = (nx * nx + ny * ny + nz * nz) ** 0.5 or 1.0
         out += struct.pack("<12fH", nx / ln, ny / ln, nz / ln, *a, *b, *c, 0)
-    data = bytes(out)
-    _preview_cache[key] = data
-    return data
+    return bytes(out)
 
 
 # ---------------------------------------------------------------- build chat
@@ -876,7 +954,6 @@ FAST_RUN = f"uv run --python 3.12 {chr(34) + _run_py + chr(34) if ' ' in _run_py
 # Speed: no MCP servers or claude.ai connectors in dashboard chats (they cost ~2 s per message and
 # bloat the prompt); scripts run on the warm worker instead of the build123d-mcp server.
 MCP_NONE = APP_DIR / "mcp-none.json"
-FRAMES_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CADPartsFrames"  # written by cadworker.py
 CHAT_TOOLS = "Read,Write,Edit,Glob,Grep,Bash"  # Bash = Git Bash on Windows (checked on the setup checklist)
 BUILD_MARK = "[[building]]"  # Claude writes this when it's done asking and starts modelling (stripped from the chat)
 ALLOWED_TOOLS = [
@@ -907,6 +984,7 @@ def chat_prompt() -> str:
     else:
         line = "- The user hasn't listed their printers yet: ask which printer a new part is for."
     return CHAT_PROMPT_BASE + "\n" + line
+
 
 _chat_lock = threading.Lock()
 _chat_proc: subprocess.Popen | None = None
@@ -949,16 +1027,22 @@ def housekeeping() -> list[str]:
     """Hide scripts/notes/chat and recycle STL versions beyond the newest N (setting, default 5) per series."""
     if ROOT is None:
         return []
-    keep = load_state()["settings"]["keep"]
-    kept = set(load_state().get("kept", []))  # versions restored from the Recycle Bin stay
+    st = load_state()
+    keep = st["settings"]["keep"]
+    kept = set(st.get("kept", []))  # versions restored from the Recycle Bin stay
+    gone = {k for k in kept if not (ROOT / k).is_file()}  # deleted since, or their part was renamed away
+    if gone:
+        update_state(lambda s: s.update(kept=[k for k in s.get("kept", []) if k not in gone]))
     to_recycle = []
     for d in ROOT.iterdir():
-        if not d.is_dir() or d.name.startswith(".") or d.name in SKIP_DIRS:
+        try:
+            if not d.is_dir() or d.name.startswith(".") or d.name in SKIP_DIRS:
+                continue
+            files = [f for f in d.iterdir() if f.is_file()]
+        except OSError:  # vanished while we looked
             continue
         series: dict[str, dict[int, list[Path]]] = {}
-        for f in d.iterdir():
-            if not f.is_file():
-                continue
+        for f in files:
             if f.suffix.lower() == ".py" or f.name.lower() in ("notes.md", CHAT_FILE):
                 _set_hidden(f)
             elif f.suffix.lower() == ".stl":
@@ -973,22 +1057,37 @@ def housekeeping() -> list[str]:
 
 
 def recycle(paths) -> None:
-    """Send files or folders to the Windows Recycle Bin (never a permanent delete)."""
-    paths = [str(p) for p in paths if Path(p).exists()]
-    if not paths:
+    """Send files or folders to the Windows Recycle Bin (never a permanent delete).
+    Done in-process with SHFileOperation: no PowerShell quoting, no command-line length limit, no hidden dialog
+    that could hang. Callers check afterwards whether each path is gone."""
+    paths = [str(Path(p).resolve()) for p in paths if Path(p).exists()]
+    if not paths or os.name != "nt":
         return
-    # Paths are passed as single-quoted PowerShell literals inside the script itself: with -Command,
-    # extra process arguments are NOT handed over as $args (they get glued onto the script text).
-    quoted = ",".join("'" + p.replace("'", "''") + "'" for p in paths)
-    ps = ("Add-Type -AssemblyName Microsoft.VisualBasic; foreach ($f in @(" + quoted + ")) { "
-          "if (Test-Path -LiteralPath $f -PathType Container) { "
-          "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($f,'OnlyErrorDialogs','SendToRecycleBin') } else { "
-          "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($f,'OnlyErrorDialogs','SendToRecycleBin') } }")
-    subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=60)
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", ctypes.c_wchar_p),
+                    ("pTo", ctypes.c_wchar_p), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", ctypes.c_wchar_p)]
+
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 0x4, 0x10, 0x40, 0x400
+    # FOF_WANTNUKEWARNING: if something can't go to the Recycle Bin (too big, a network drive), Windows asks
+    # instead of silently deleting it for good: the one dialog left, and the only safe answer to that case.
+    FOF_WANTNUKEWARNING = 0x4000
+    for i in range(0, len(paths), 200):
+        buf = ctypes.create_unicode_buffer("\0".join(paths[i:i + 200]) + "\0\0")  # double-NUL-terminated list
+        op = SHFILEOPSTRUCTW(None, FO_DELETE, ctypes.cast(buf, ctypes.c_wchar_p), None,
+                             FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI | FOF_WANTNUKEWARNING,
+                             False, None, None)
+        try:
+            ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        except OSError:
+            pass
 
 
 # Dashboard state for one parts folder, kept in <parts>\.cadparts\state.json so it travels with the folder
-# (OneDrive: the laptop sees the same favorites, tags and settings). "complete" is a retired label.
+# (OneDrive: the laptop sees the same favorites, categories and settings).
 def state_file() -> Path:
     return ROOT / META / "state.json"
 
@@ -1002,9 +1101,11 @@ def load_state() -> dict:
         st = json.loads(state_file().read_text(encoding="utf-8")) if ROOT else {}
     except (OSError, ValueError):
         st = {}
-    st.setdefault("complete", [])
+    if not isinstance(st, dict):
+        st = {}
+    for retired in ("complete", "tags"):  # labels from older versions: dropped the next time state is saved
+        st.pop(retired, None)
     st.setdefault("favorites", [])
-    st.setdefault("tags", {})
     st.setdefault("categories", {})
     s = st.setdefault("settings", {})
     s.setdefault("model", st.get("model") or "")  # "" = Claude Code's default
@@ -1032,7 +1133,22 @@ def save_state(st: dict) -> None:
     f.parent.mkdir(parents=True, exist_ok=True)
     tmp = f.with_suffix(".tmp")
     tmp.write_text(json.dumps(st, indent=2), encoding="utf-8")
-    os.replace(tmp, f)
+    _replace(tmp, f, "your settings")
+
+
+def _replace(tmp: Path, dest: Path, what: str) -> None:
+    """os.replace, retried: OneDrive (or a virus scanner) briefly holding the file open makes Windows refuse it."""
+    for i in range(8):
+        try:
+            os.replace(tmp, dest)
+            return
+        except PermissionError:
+            time.sleep(0.1 * (i + 1))
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    raise OSError(f"couldn't save {what}: another program (OneDrive?) has the file open. Try again in a moment.")
 
 
 def update_state(fn) -> dict:
@@ -1060,11 +1176,12 @@ def merge_sync_copies() -> list[str]:
                 other = json.loads(f.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            for key in ("favorites", "complete", "kept"):
+            if not isinstance(other, dict):
+                other = {}
+            for key in ("favorites", "kept"):
                 st[key] = sorted(set(st.get(key, [])) | set(other.get(key) or []))
-            for key in ("categories", "tags"):
-                for k, v in (other.get(key) or {}).items():
-                    st.setdefault(key, {}).setdefault(k, v)
+            for k, v in (other.get("categories") or {}).items():
+                st["categories"].setdefault(k, v)
             names = {x["name"].lower() for x in st["settings"]["printers"]}
             extra = [x for x in clean_printers((other.get("settings") or {}).get("printers")) if x["name"].lower() not in names]
             st["settings"]["printers"] = (st["settings"]["printers"] + extra)[:12]
@@ -1075,18 +1192,42 @@ def merge_sync_copies() -> list[str]:
     return [f.name for f in merged]
 
 
+_PS_QUOTES = re.compile("(['‘’‚‛])")  # PowerShell ends a '...' string at any of these
+
+
 def _ps_lit(s: str) -> str:
-    return "'" + str(s).replace("'", "''") + "'"
+    """A PowerShell single-quoted string literal for any text (a quote is escaped by doubling it)."""
+    return "'" + _PS_QUOTES.sub(r"\1\1", str(s)) + "'"
+
+
+def _ps(script: str, timeout: int = 60, **env) -> str | None:
+    """Run a hidden PowerShell script; values go in as environment variables ($env:NAME), never pasted into the
+    script. Returns its output, or None if PowerShell couldn't run or took too long."""
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "[Console]::OutputEncoding = [Text.Encoding]::UTF8\n" + script], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, env={**os.environ, **env})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout or ""
+
+
+# $root and $from are compared as whole folders, so a sibling such as "cad-parts-app" isn't taken for "cad-parts".
+_PS_UNDER_ROOT = r"""
+$root = $env:CADP_ROOT.TrimEnd('\')
+function Under-Root([string]$p) { $p -and ($p -ieq $root -or $p.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) }
+"""
 
 
 def trash_list() -> list[dict]:
     """Items in the Windows Recycle Bin that were deleted from cad-parts (newest first)."""
-    ps = r"""
-$root = %ROOT%
+    if ROOT is None:
+        return []
+    ps = _PS_UNDER_ROOT + r"""
 $sh = New-Object -ComObject Shell.Application
 $out = foreach ($it in $sh.NameSpace(10).Items()) {
   $from = [string]$it.ExtendedProperty('System.Recycle.DeletedFrom')
-  if (-not $from -or -not $from.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { continue }
+  if (-not (Under-Root $from)) { continue }
   $name = $it.Name; $ext = [IO.Path]::GetExtension($it.Path)
   if (-not $it.IsFolder -and $ext -and -not $name.EndsWith($ext, [StringComparison]::OrdinalIgnoreCase)) { $name += $ext }
   $when = $it.ExtendedProperty('System.Recycle.DateDeleted')
@@ -1094,28 +1235,33 @@ $out = foreach ($it in $sh.NameSpace(10).Items()) {
                      deleted = $(if ($when) { ([DateTime]$when).ToString('yyyy-MM-ddTHH:mm:ss') + 'Z' } else { '' }) }  # Windows gives this in UTC already
 }
 @($out) | ConvertTo-Json -Compress -Depth 3
-""".replace("%ROOT%", _ps_lit(str(ROOT)))
-    r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=60)
+"""
+    out = _ps(ps, CADP_ROOT=str(ROOT))
     try:
-        items = json.loads(r.stdout or "[]")
+        items = json.loads(out or "[]")
     except ValueError:
         return []
-    items = items if isinstance(items, list) else [items]
+    items = [x for x in (items if isinstance(items, list) else [items]) if isinstance(x, dict) and x.get("from")]
     for it in items:
-        rel = os.path.relpath(it["from"], ROOT)
+        try:
+            rel = os.path.relpath(it["from"], ROOT)
+        except ValueError:  # another drive
+            rel = "."
         it["part"] = None if rel == "." else rel.split(os.sep)[0]  # which part it belonged to (None = a whole part)
     return sorted(items, key=lambda x: x.get("deleted", ""), reverse=True)
 
 
 def trash_restore(item_id: str) -> dict:
     """Move one Recycle Bin item back to where it was deleted from (only items that came from cad-parts)."""
-    ps = r"""
-$root = %ROOT%; $id = %ID%
+    if ROOT is None:
+        return {"ok": False, "error": "finish the setup first"}
+    ps = _PS_UNDER_ROOT + r"""
+$id = $env:CADP_ID
 $sh = New-Object -ComObject Shell.Application
 $it = @($sh.NameSpace(10).Items() | Where-Object { $_.Path -eq $id })[0]
 if (-not $it) { 'gone'; exit }
 $from = [string]$it.ExtendedProperty('System.Recycle.DeletedFrom')
-if (-not $from.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { 'outside'; exit }
+if (-not (Under-Root $from)) { 'outside'; exit }
 $name = $it.Name; $ext = [IO.Path]::GetExtension($it.Path)
 if (-not $it.IsFolder -and $ext -and -not $name.EndsWith($ext, [StringComparison]::OrdinalIgnoreCase)) { $name += $ext }
 if (Test-Path -LiteralPath (Join-Path $from $name)) { 'exists'; exit }
@@ -1123,15 +1269,20 @@ New-Item -ItemType Directory -Force -Path $from | Out-Null
 $sh.NameSpace($from).MoveHere($it, 0x14)
 Start-Sleep -Milliseconds 400
 if (Test-Path -LiteralPath (Join-Path $from $name)) { Join-Path $from $name; 'ok' } else { 'failed' }
-""".replace("%ROOT%", _ps_lit(str(ROOT))).replace("%ID%", _ps_lit(item_id))
-    r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=60)
-    lines = (r.stdout or "").strip().splitlines()
+"""
+    out = _ps(ps, CADP_ROOT=str(ROOT), CADP_ID=str(item_id))
+    if out is None:
+        return {"ok": False, "error": "Windows didn't answer in time; try again"}
+    lines = out.strip().splitlines()
     res = lines[-1:] or ["failed"]
-    if res[0] == "ok" and len(lines) >= 2 and ROOT:  # a version file brought back on purpose: housekeeping keeps it
+    if res[0] == "ok" and len(lines) >= 2:  # a version file brought back on purpose: housekeeping keeps it
         try:
-            rel = Path(lines[-2]).resolve().relative_to(ROOT.resolve())
-            if len(rel.parts) == 2 and rel.suffix.lower() in MODEL_EXT:
-                update_state(lambda st: st.setdefault("kept", []).append(rel.as_posix()))
+            rel = Path(lines[-2]).resolve().relative_to(ROOT.resolve()).as_posix()
+            if len(rel.split("/")) == 2 and Path(rel).suffix.lower() in MODEL_EXT:
+                def keep(st):
+                    if rel not in st.setdefault("kept", []):
+                        st["kept"].append(rel)
+                update_state(keep)
         except (ValueError, OSError):
             pass
     msg = {"ok": None, "gone": "it's no longer in the Recycle Bin", "outside": "not a cad-parts item",
@@ -1141,6 +1292,10 @@ if (Test-Path -LiteralPath (Join-Path $from $name)) { Join-Path $from $name; 'ok
 
 def delete_item(part: str, file: str | None) -> dict:
     """Send a whole part folder, or one model file in it, to the Recycle Bin (never a permanent delete)."""
+    if ROOT is None:
+        return {"ok": False, "error": "finish the setup first"}
+    if _chat_lock.locked():  # Claude may be writing into that very folder
+        return {"ok": False, "error": "wait until Claude has finished"}
     if not part or "/" in part or "\\" in part or part.startswith((".", "_")) or part in SKIP_DIRS:
         return {"ok": False, "error": "not a part"}
     d = ROOT / part
@@ -1155,20 +1310,8 @@ def delete_item(part: str, file: str | None) -> dict:
     recycle([d])
     if d.exists():
         return {"ok": False, "error": "couldn't move it to the Recycle Bin (is a file open somewhere?)"}
-    # its favorite star and tags are kept in state.json, so a restore from the Recycle Bin brings them back
+    # its favorite star and category are kept in state.json, so a restore from the Recycle Bin brings them back
     return {"ok": True}
-
-
-def set_complete(part: str, on: bool) -> dict:
-    if not part or "/" in part or "\\" in part or not (ROOT / part).is_dir():
-        return {"ok": False, "error": "unknown part"}
-    with _state_lock:
-        st = load_state()
-        done = set(st["complete"])
-        (done.add if on else done.discard)(part)
-        st["complete"] = sorted(done)
-        save_state(st)
-    return {"ok": True, "sig": scan()["sig"]}
 
 
 # ---------------------------------------------------------------- parts: rename / duplicate / meta
@@ -1187,25 +1330,38 @@ def part_dir(name: str) -> Path | None:
     return d if d.is_dir() and d.resolve().parent == ROOT.resolve() else None
 
 
+def _name_re(old: str) -> re.Pattern:
+    """`old` as a whole part name: "cup" matches cup/, cup_v3_x.stl and "cup" but not cupboard or cup-holder."""
+    return re.compile(r"(?<![A-Za-z0-9-])" + re.escape(old) + r"(?![A-Za-z0-9-])")
+
+
+def _retagged(name: str, old: str, new: str) -> str:
+    """A file name in old's folder, renamed for new: `<old>_v3_x.stl` -> `<new>_v3_x.stl` (others unchanged)."""
+    stem = name.rsplit(".", 1)[0]
+    return new + name[len(old):] if name.startswith(old + "_") or stem == old else name
+
+
 def _retag_files(d: Path, old: str, new: str, files=None) -> None:
     """Rename `<old>_...` files in d to `<new>_...`, and point scripts/notes at the new name."""
+    pat = _name_re(old)
     for f in list(files if files is not None else d.iterdir()):
         if not f.is_file() or f.name.lower() == CHAT_FILE:
             continue
         target = f
-        if f.name.startswith(old + "_") or f.stem == old:
-            target = f.with_name(new + f.name[len(old):])
+        if _retagged(f.name, old, new) != f.name:
+            target = f.with_name(_retagged(f.name, old, new))
             f.rename(target)
         if target.suffix.lower() == ".py" or target.name.lower() == "notes.md":
             try:
                 txt = target.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            if old in txt:
+            changed = pat.sub(lambda _: new, txt)
+            if changed != txt:
                 hidden = _is_hidden(target)
                 if hidden:  # Windows won't open a hidden file for overwriting
                     _set_attr(target, hidden=False)
-                target.write_text(txt.replace(old, new), encoding="utf-8")
+                target.write_text(changed, encoding="utf-8")
                 if hidden:
                     _set_hidden(target)
 
@@ -1234,15 +1390,19 @@ def _move_meta(old: str, new: str, copy: bool = False) -> None:
     def fn(st):
         if old in st["favorites"] and new not in st["favorites"]:
             st["favorites"].append(new)
-        if old in st["tags"]:
-            st["tags"][new] = list(st["tags"][old])
         if old in st["categories"]:
             st["categories"][new] = st["categories"][old]
         if not copy:
             st["favorites"] = [n for n in st["favorites"] if n != old]
-            st["tags"].pop(old, None)
-            st["categories"].pop(old, None)
-            st["complete"] = [new if n == old else n for n in st["complete"]]
+            if old != new:
+                st["categories"].pop(old, None)
+            kept = []
+            for k in st.get("kept", []):  # "old/old_v2.stl" -> "new/new_v2.stl", the way the files were renamed
+                folder, _, name = k.partition("/")
+                k = f"{new}/{_retagged(name, old, new)}" if folder == old else k
+                if k not in kept:
+                    kept.append(k)
+            st["kept"] = kept
     update_state(fn)
 
 
@@ -1254,16 +1414,29 @@ def rename_part(old: str, to: str) -> dict:
         return {"ok": False, "error": "use letters, numbers and dashes"}
     if new == old:
         return {"ok": True, "name": new}
-    if (ROOT / new).exists():
+    case_only = new.lower() == old.lower()  # "Cup" -> "cup": Windows sees the same folder
+    if (ROOT / new).exists() and not case_only:
         return {"ok": False, "error": f"there's already a part called {new}"}
     if _chat_lock.locked():
         return {"ok": False, "error": "wait until Claude has finished"}
     try:
-        d = d.rename(ROOT / new)
-        _retag_files(d, old, new)
+        if case_only:  # through a temporary name, so the new capitalisation really sticks
+            mid = d.rename(ROOT / f"{new}.renaming-{secrets.token_hex(3)}")
+            try:
+                d = mid.rename(ROOT / new)
+            except OSError:
+                mid.rename(ROOT / old)
+                raise
+        else:
+            d = d.rename(ROOT / new)
     except OSError as e:
         return {"ok": False, "error": f"Windows wouldn't rename it (is a file open somewhere?) {e.strerror or ''}".strip()}
-    _move_meta(old, new)
+    try:
+        _retag_files(d, old, new)
+    except OSError as e:
+        return {"ok": True, "name": new, "note": f"some files inside keep the old name ({e.strerror or e})"}
+    finally:  # the folder has its new name either way: its favorite star, category and kept versions follow it
+        _move_meta(old, new)
     return {"ok": True, "name": new}
 
 
@@ -1337,16 +1510,6 @@ def set_meta(name: str, body: dict) -> dict:
                 st["categories"][name] = same or c
             else:
                 st["categories"].pop(name, None)
-        if "tags" in body:
-            tags = []
-            for t in body["tags"] or []:
-                t = re.sub(r"\s+", " ", str(t)).strip()[:24]
-                if t and t.lower() not in [x.lower() for x in tags]:
-                    tags.append(t)
-            if tags:
-                st["tags"][name] = tags
-            else:
-                st["tags"].pop(name, None)
     update_state(fn)
     return {"ok": True, "sig": scan()["sig"]}
 
@@ -1363,10 +1526,10 @@ def load_profiles() -> dict:
 
 
 def save_profiles(d: dict) -> None:
-    APP_DATA.mkdir(parents=True, exist_ok=True)
+    PROFILES_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = PROFILES_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
-    os.replace(tmp, PROFILES_FILE)
+    _replace(tmp, PROFILES_FILE, "your profiles")
 
 
 def count_parts(folder: Path) -> int:
@@ -1479,10 +1642,42 @@ def sync_services() -> list[tuple[str, Path]]:
         except (OSError, ValueError, AttributeError, TypeError):
             pass
     out += [("Dropbox", home / "Dropbox"), ("Google Drive", home / "Google Drive"), ("Google Drive", home / "My Drive")]
-    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":  # Google Drive for desktop shows up as a drive with "My Drive" in it
-        out.append(("Google Drive", Path(f"{letter}:\\My Drive")))
+    # Google Drive for desktop shows up as a drive with "My Drive" in it: its own settings say which one
+    out += [("Google Drive", Path(m) / "My Drive") for m in _google_drive_mounts()]
+    out += [("Google Drive", Path(f"{letter}:\\My Drive")) for letter in _local_drives()]
     out += [("iCloud Drive", home / "iCloudDrive"), ("Box", home / "Box")]
-    return [(n, p) for n, p in out if p.is_dir()]
+    res = []
+    for n, p in out:
+        try:
+            if p.is_dir() and (n, p) not in res:
+                res.append((n, p))
+        except OSError:
+            pass
+    return res
+
+
+def _google_drive_mounts() -> list[str]:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\DriveFS") as k:
+            prefs = json.loads(winreg.QueryValueEx(k, "PerAccountPreferences")[0])
+        return [str(a["value"]["mount_point_path"]).rstrip("\\") + "\\" for a in prefs.get("per_account_preferences", [])
+                if (a.get("value") or {}).get("mount_point_path")]
+    except Exception:  # noqa: BLE001 - not installed, or a format we don't know
+        return []
+
+
+def _local_drives() -> list[str]:
+    """Drive letters D..Z that exist and are local (fixed/removable): a disconnected network drive can stall a
+    simple is_dir() check for many seconds."""
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        mask = k.GetLogicalDrives()
+        return [c for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ") if i >= 3 and mask >> i & 1
+                and k.GetDriveTypeW(f"{c}:\\") in (2, 3)]  # DRIVE_REMOVABLE, DRIVE_FIXED
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def sync_roots() -> list[Path]:
@@ -1682,18 +1877,32 @@ def peek_export(path: str) -> dict:
 def import_parts(path: str, folder: Path) -> dict:
     """Unpack a CAD Parts file into `folder`. Parts the folder already has are left alone (reported back)."""
     folder.mkdir(parents=True, exist_ok=True)
+    base = folder.resolve()
     have = {d.name.lower() for d in folder.iterdir() if d.is_dir()}
     skipped, n = set(), 0
     with zipfile.ZipFile(path) as z:
         for info in z.infolist():
             name = info.filename
-            parts = Path(name).parts
-            if info.is_dir() or name == EXPORT_MANIFEST or not parts or Path(name).is_absolute() or ".." in parts or ":" in name:
+            # A CAD Parts file only ever holds part folders, .cadparts, ready-to-print and top-level notes (.md).
+            # Anything else (an absolute path, "..", a drive, .claude/…) is someone's attempt to write elsewhere.
+            if info.is_dir() or name == EXPORT_MANIFEST or ":" in name or name.startswith(("/", "\\")):
+                continue
+            parts = re.split(r"[/\\]", name)
+            if not all(parts) or any(p in (".", "..") or p != p.rstrip(". ") for p in parts):
                 continue
             top = parts[0]
+            if len(parts) == 1:
+                if not top.lower().endswith(".md") or (folder / top).exists():
+                    continue  # never replace this folder's own CLAUDE.md or notes
+            elif top != META and (top.startswith((".", "_")) or (top in SKIP_DIRS and top != "ready-to-print")):
+                continue
+            target = (folder / Path(*parts)).resolve()
+            try:
+                target.relative_to(base)
+            except ValueError:
+                continue
             if len(parts) > 1 and top != META and top.lower() in have:
                 skipped.add(top); continue
-            target = folder / Path(*parts)
             if top == META and target.exists():
                 continue  # this folder's own app data wins
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1709,6 +1918,18 @@ def import_parts(path: str, folder: Path) -> dict:
     return {"files": n, "skipped": sorted(skipped)}
 
 
+def _pick(ps: str) -> str | None:
+    """Run a Windows picker dialog script; the chosen path, or None (cancelled, or PowerShell failed)."""
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command",
+                            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; " + ps],  # paths with any letters
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = (r.stdout or "").strip().splitlines()
+    return out[-1] if out else None
+
+
 def pick_file(start: str = "") -> str | None:
     """Windows' file picker for a CAD Parts file (when the app window can't show its own)."""
     ps = ("Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog;"
@@ -1716,9 +1937,7 @@ def pick_file(start: str = "") -> str | None:
           "$f.InitialDirectory = " + _ps_lit(start or str(Path.home() / "Downloads")) + ";"
           "$o = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false};"
           "if ($f.ShowDialog($o) -eq 'OK') { $f.FileName }")
-    r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], capture_output=True, text=True, timeout=600)
-    out = (r.stdout or "").strip().splitlines()
-    return out[-1] if out else None
+    return _pick(ps)
 
 
 def _known_folder(csidl: int) -> Path | None:
@@ -1776,9 +1995,7 @@ def pick_folder(start: str = "") -> str | None:
           "$f.ShowNewFolderButton = $true; $f.SelectedPath = " + _ps_lit(start) + ";"
           "$o = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false};"
           "if ($f.ShowDialog($o) -eq 'OK') { $f.SelectedPath }")
-    r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], capture_output=True, text=True, timeout=600)
-    out = (r.stdout or "").strip().splitlines()
-    return out[-1] if out else None
+    return _pick(ps)
 
 
 def save_profile(body: dict) -> dict:
@@ -1813,6 +2030,7 @@ def save_profile(body: dict) -> dict:
         d["profiles"].append(prof)
     prof.update(name=name, folder=folder)
     save_profiles(d)
+    _found_cache["t"] = 0  # the folder list changed (a new or newly used folder)
     if not activate_profile(prof["id"]):
         return {"ok": False, "error": "couldn't open that folder"}
     default = str(body.get("printer", ""))
@@ -1885,7 +2103,7 @@ def save_chat(key: str, chat: dict) -> dict:
     tmp.write_text(json.dumps(chat, ensure_ascii=False), encoding="utf-8")
     if p.exists():
         _set_attr(p, hidden=False)  # os.replace can't overwrite a hidden file on Windows
-    os.replace(tmp, p)
+    _replace(tmp, p, "the chat")
     if key != "new":
         _set_hidden(p)
     return {"ok": True}
@@ -1919,15 +2137,19 @@ def notify(title: str, body: str) -> None:
     """A Windows toast (shown even when the dashboard is in the background)."""
     xml = ("<toast><visual><binding template='ToastGeneric'><text>{}</text><text>{}</text></binding></visual>"
            "<audio src='ms-winsoundevent:Notification.Default'/></toast>")
-    esc = lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("'", "&apos;")[:200]  # noqa: E731
+    esc = lambda s: str(s)[:200].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("'", "&apos;")  # noqa: E731
     ps = ("[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] > $null;"
           "[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] > $null;"
-          "$x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml(" + _ps_lit(xml.format(esc(title), esc(body))) + ");"
+          # the text (Claude's reply) comes in through the environment, never as part of the script
+          "$x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml($env:CADP_TOAST);"
           "$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
           "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show("
           "[Windows.UI.Notifications.ToastNotification]::new($x))")
-    subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                         env={**os.environ, "CADP_TOAST": xml.format(esc(title), esc(body))})
+    except OSError:
+        pass  # no toast, nothing else lost
 
 
 def _file_new_parts(origin: str, new_parts: list[str]) -> str:
@@ -1948,10 +2170,18 @@ def _file_new_parts(origin: str, new_parts: list[str]) -> str:
 def run_chat(handler, message: str, session: str | None, context: str, origin: str = ""):
     """Stream one Claude turn to the browser as newline-delimited JSON events."""
     global _chat_proc
+    gone = []  # set once the page has gone away (window closed, reload)
 
     def emit(obj):
-        handler.wfile.write((json.dumps(obj) + "\n").encode())
-        handler.wfile.flush()
+        if gone:
+            return
+        try:
+            handler.wfile.write((json.dumps(obj) + "\n").encode())
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+            gone.append(True)  # nobody is reading: stop Claude now instead of letting it build on unseen
+            if _chat_proc and _chat_proc.poll() is None:
+                _kill_tree(_chat_proc)
 
     handler.send_response(200)
     handler.send_header("Content-Type", "application/x-ndjson")
@@ -1988,12 +2218,18 @@ def run_chat(handler, message: str, session: str | None, context: str, origin: s
         try:
             proc = subprocess.Popen(args, cwd=str(ROOT), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
-        except FileNotFoundError:
-            emit({"t": "error", "text": "Couldn't find the claude command on this PC."})
+        except OSError:
+            emit({"t": "error", "text": "Couldn't start the claude command on this PC."})
             return
         _chat_proc = proc
-        proc.stdin.write(prompt)
-        proc.stdin.close()
+        errs: list[str] = []  # read alongside stdout: a full stderr pipe would otherwise stall Claude forever
+        err_reader = threading.Thread(target=lambda: errs.append(proc.stderr.read() or ""), daemon=True)
+        err_reader.start()
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except OSError:  # it exited straight away; its stderr says why
+            pass
         for line in proc.stdout:
             try:
                 ev = json.loads(line)
@@ -2022,29 +2258,47 @@ def run_chat(handler, message: str, session: str | None, context: str, origin: s
                     emit({"t": "error", "text": str(ev.get("result") or ev.get("subtype") or "Claude stopped with an error.")})
                 emit({"t": "session", "id": ev.get("session_id")})
         proc.wait()
-        if proc.returncode:
-            err = (proc.stderr.read() or "").strip()[-400:]
-            emit({"t": "error", "text": err or "Stopped."})
-        made = sorted(d.name for d in ROOT.iterdir() if d.is_dir() and d.name not in parts_before
-                      and not d.name.startswith((".", "_")) and d.name not in SKIP_DIRS)
-        cat = _file_new_parts(origin, made)
-        if cat:
-            emit({"t": "note", "text": f"Filed {', '.join(made)} in the {cat} category, next to {origin}."})
-        recycled = housekeeping()
-        if recycled:
-            emit({"t": "note", "text": f"Moved to Recycle Bin (keeping the newest {load_state()['settings']['keep']}): " + ", ".join(recycled)})
-        emit({"t": "done"})
-    except (BrokenPipeError, ConnectionResetError):
-        pass
+        if proc.returncode and not gone:
+            err_reader.join(timeout=2)
+            emit({"t": "error", "text": "".join(errs).strip()[-400:] or "Stopped."})
+        try:  # whatever Claude managed to make is tidied up, even if the page has gone
+            made = sorted(d.name for d in ROOT.iterdir() if d.is_dir() and d.name not in parts_before
+                          and not d.name.startswith((".", "_")) and d.name not in SKIP_DIRS)
+            cat = _file_new_parts(origin, made)
+            if cat:
+                emit({"t": "note", "text": f"Filed {', '.join(made)} in the {cat} category, next to {origin}."})
+            recycled = housekeeping()
+            if recycled:
+                emit({"t": "note", "text": f"Moved to Recycle Bin (keeping the newest {load_state()['settings']['keep']}): " + ", ".join(recycled)})
+        except Exception as e:  # noqa: BLE001 - the reply itself is done; say what went wrong afterwards
+            emit({"t": "note", "text": f"Tidying up after the reply failed: {e}"[:300]})
+    except Exception as e:  # noqa: BLE001
+        emit({"t": "error", "text": f"Something went wrong: {e}"[:300]})
     finally:
+        if _chat_proc and _chat_proc.poll() is None:
+            _kill_tree(_chat_proc)
         _chat_proc = None
         _chat_lock.release()
+        emit({"t": "done"})
+
+
+def _kill_tree(p: subprocess.Popen) -> None:
+    """Stop Claude Code and everything it started (its build scripts)."""
+    try:
+        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            p.kill()
+        except OSError:
+            pass
 
 
 def safe_path(rel: str) -> Path | None:
+    """A path inside the parts folder, or None. `rel` is already decoded (callers unquote URL paths themselves;
+    query strings come decoded from parse_qs), so a file name with % in it works."""
     if ROOT is None:
         return None
-    p = (ROOT / unquote(rel)).resolve()
+    p = (ROOT / rel).resolve()
     try:
         p.relative_to(ROOT.resolve())
     except ValueError:
@@ -2056,13 +2310,52 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # keep the console quiet
         pass
 
-    def send(self, code: int, body: bytes, ctype: str):
+    def send(self, code: int, body: bytes, ctype: str, cache: str = "no-store", headers=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def body_json(self):
+        """The request's JSON body as a dict, or None if it's missing a sane length or isn't JSON."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n < 0 or n > 50 * 1024 * 1024:
+                return None
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+
+    def _safely(self, fn):
+        """A failing request answers with a JSON error instead of a dropped connection."""
+        try:
+            fn()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            try:
+                self.json({"ok": False, "error": str(e)[:300] or type(e).__name__}, 500)
+            except OSError:
+                pass
+
+    def page_key_ok(self, u) -> tuple[bool, bool]:
+        """(allowed, via the URL): the launch key in ?k= (the launcher) or in the cookie set on that first visit."""
+        if not KEY:
+            return False, False
+        given = parse_qs(u.query).get("k", [""])[0]
+        if given and secrets.compare_digest(given.encode(), KEY.encode()):
+            return True, True
+        from http.cookies import CookieError, SimpleCookie
+        try:
+            c = SimpleCookie(self.headers.get("Cookie") or "").get("cadk")
+        except CookieError:
+            c = None
+        return bool(c and secrets.compare_digest(c.value.encode(), KEY.encode())), False
 
     def json(self, obj, code=200):
         self.send(code, json.dumps(obj).encode(), "application/json")
@@ -2090,44 +2383,31 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self):
+        self._safely(self._get)
+
+    def do_POST(self):
+        self._safely(self._post)
+
+    def _get(self):
         if bad := self.blocked(False):
             return self.json({"ok": False, "error": "blocked: " + bad}, 403)
         u = urlparse(self.path)
-        if u.path in ("/", "/index.html"):
+        if u.path in ("/", "/index.html"):  # the page holds TOKEN, so only for whoever has the launch key
+            ok, via_url = self.page_key_ok(u)
+            if not ok:
+                return self.send(403, b"<!DOCTYPE html><meta charset='utf-8'><title>CAD Parts</title>"
+                                      b"<p style='font:16px system-ui;margin:3em'>Open CAD Parts from the Start menu.</p>",
+                                 "text/html; charset=utf-8")
             page = (APP_DIR / "index.html").read_bytes().replace(b"__CAD_TOKEN__", TOKEN.encode())
-            return self.send(200, page, "text/html; charset=utf-8")
-        if u.path in ("/app.js", "/app.css"):
+            cookie = {"Set-Cookie": f"cadk={KEY}; Path=/; HttpOnly; SameSite=Strict"} if via_url else None
+            return self.send(200, page, "text/html; charset=utf-8", headers=cookie)
+        if u.path in ("/app.js", "/app.css"):  # no secrets in these: served without the key
             return self.send(200, (APP_DIR / u.path[1:]).read_bytes(),
                              ("text/javascript" if u.path.endswith(".js") else "text/css") + "; charset=utf-8")
         if u.path == "/api/ping":
             return self.json({"ok": True})
         if u.path == "/api/parts":
             return self.json(scan())
-        if u.path == "/api/frames":  # newest recorded construction steps since `since` (optionally one part)
-            q = parse_qs(u.query)
-            since = float(q.get("since", ["0"])[0] or 0)
-            want = q.get("part", [""])[0]
-            best = None
-            if FRAMES_ROOT.is_dir():
-                for d in FRAMES_ROOT.iterdir():
-                    if want and d.name != want:
-                        continue
-                    try:
-                        m = json.loads((d / "latest.json").read_text(encoding="utf-8"))
-                    except (OSError, ValueError):
-                        continue
-                    if m.get("t", 0) > since and (best is None or m["t"] > best["t"]):
-                        best = m
-            return self.json({"manifest": best})
-        if u.path.startswith("/frames/"):
-            p = (FRAMES_ROOT / unquote(u.path[len("/frames/"):])).resolve()
-            try:
-                p.relative_to(FRAMES_ROOT.resolve())
-            except ValueError:
-                return self.send(404, b"not found", "text/plain")
-            if not p.is_file() or p.suffix.lower() != ".stl":
-                return self.send(404, b"not found", "text/plain")
-            return self.send(200, p.read_bytes(), "application/octet-stream")
         if u.path == "/api/trash":
             return self.json({"items": trash_list(), "root": str(ROOT)})
         if u.path == "/api/profiles":
@@ -2141,13 +2421,7 @@ class Handler(BaseHTTPRequestHandler):
             png = app_icon(parse_qs(u.query).get("id", [""])[0])
             if not png:
                 return self.send(404, b"no icon", "text/plain")
-            self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(png)))
-            self.send_header("Cache-Control", "max-age=86400")
-            self.end_headers()
-            self.wfile.write(png)
-            return
+            return self.send(200, png, "image/png", cache="max-age=86400")
         if u.path == "/api/apps":
             return self.json(apps_info())
         if u.path == "/api/health":
@@ -2183,21 +2457,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(404, b"not found", "text/plain")
             if not p.is_file() or p.suffix != ".js":
                 return self.send(404, b"not found", "text/plain")
-            body = p.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/javascript; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "max-age=86400")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if u.path.startswith("/files/"):
-            p = safe_path(u.path[len("/files/"):])
-            if not p or not p.is_file() or p.suffix.lower() not in MODEL_EXT:
-                return self.send(404, b"not found", "text/plain")
-            return self.send(200, p.read_bytes(), "application/octet-stream")
+            return self.send(200, p.read_bytes(), "text/javascript; charset=utf-8", cache="max-age=86400")
         if u.path.startswith("/preview/"):  # any model, always as STL
-            p = safe_path(u.path[len("/preview/"):])
+            p = safe_path(unquote(u.path[len("/preview/"):]))
             if not p or not p.is_file() or p.suffix.lower() not in MODEL_EXT:
                 return self.send(404, b"not found", "text/plain")
             if p.suffix.lower() == ".stl":
@@ -2208,57 +2470,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(422, f"could not read 3MF: {e}".encode(), "text/plain")
         self.send(404, b"not found", "text/plain")
 
-    def do_POST(self):
+    def _post(self):
         if bad := self.blocked(True):
             return self.json({"ok": False, "error": "blocked: " + bad}, 403)
         u = urlparse(self.path)
         q = parse_qs(u.query)
-        rel = q.get("path", [""])[0]
+        rel = q.get("path", [""])[0]  # already decoded by parse_qs
         if u.path == "/api/open":
             return self.json(open_with(q.get("app", [""])[0], rel))
         if u.path == "/api/apps/pick":
             return self.json(pick_app())
         if u.path == "/api/apps/defaults":
-            try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-            except ValueError:
+            if (body := self.body_json()) is None:
                 return self.json({"ok": False}, 400)
             return self.json(set_default_apps(body))
-        if u.path == "/api/blender":
-            p = safe_path(rel)
-            if not p or not p.is_file() or p.suffix.lower() != ".stl":
-                return self.json({"ok": False, "error": "not an STL in cad-parts"}, 400)
-            blender = find_blender()
-            if not blender:
-                return self.json({"ok": False, "error": "Blender isn't installed"})
-            VIEWER_STATE.mkdir(parents=True, exist_ok=True)
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SHOW_PS1),
-                 "-Path", str(p), "-Blender", blender, "-State", str(VIEWER_STATE)],
-                capture_output=True, text=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            return self.json({"ok": r.returncode == 0, "out": r.stdout.strip() or r.stderr.strip()})
-        if u.path == "/api/bambu":
-            p = safe_path(rel)
-            if not p or not p.is_file() or p.suffix.lower() not in MODEL_EXT:
-                return self.json({"ok": False, "error": "not a model in cad-parts"}, 400)
-            bambu = find_bambu()
-            if not bambu:
-                return self.json({"ok": False, "error": "Bambu Studio isn't installed"})
-            # Bambu's own "single_instance" preference (turned on 2026-11-25 in BambuStudio.conf) hands the
-            # file to an already-open window. Don't pass --single-instance: this build exits with -2 on it.
-            subprocess.Popen([bambu, str(p)], cwd=str(Path(bambu).parent),
-                             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
-            return self.json({"ok": True})
-        if u.path == "/api/restore":
-            return self.json(trash_restore(q.get("id", [""])[0]))
-        if u.path == "/api/delete":
-            part_name, _, file = rel.strip("/").partition("/")
-            return self.json(delete_item(part_name, file or None))
         if u.path == "/api/profile/save":
-            try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-            except ValueError:
+            if (body := self.body_json()) is None:
                 return self.json({"ok": False}, 400)
             return self.json(save_profile(body))
         if u.path == "/api/profile/switch":
@@ -2279,7 +2506,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json({"ok": False, "error": "choose where to save it"})
             if (_jobs.get("export") or {}).get("state") == "running":
                 return self.json({"ok": True})
-            name = next((x["name"] for x in load_profiles()["profiles"] if x["id"] == load_profiles()["active"]), "")
+            profs = load_profiles()
+            name = next((x["name"] for x in profs["profiles"] if x["id"] == profs["active"]), "")
             _jobs.pop("export", None)
             threading.Thread(target=_run_job, args=("export", lambda: export_parts(dest, name)), daemon=True).start()
             return self.json({"ok": True})
@@ -2287,14 +2515,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"path": pick_folder(q.get("start", [""])[0])})
         if ROOT is None and u.path not in ("/api/quit", "/api/chat/stop"):
             return self.json({"ok": False, "error": "finish the setup first"})
+        if u.path == "/api/restore":
+            return self.json(trash_restore(q.get("id", [""])[0]))
+        if u.path == "/api/delete":
+            part_name, _, file = rel.strip("/").partition("/")
+            return self.json(delete_item(part_name, file or None))
         if u.path == "/api/rename":
             return self.json(rename_part(rel.strip("/"), q.get("to", [""])[0]))
         if u.path == "/api/duplicate":
             return self.json(duplicate_part(rel.strip("/")))
         if u.path in ("/api/meta", "/api/settings", "/api/chat/save", "/api/notify", "/api/category"):
-            try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-            except ValueError:
+            if (body := self.body_json()) is None:
                 return self.json({"ok": False}, 400)
             if u.path == "/api/meta":
                 return self.json(set_meta(rel.strip("/"), body))
@@ -2319,22 +2550,17 @@ class Handler(BaseHTTPRequestHandler):
             update_state(fn)
             return self.json({"ok": True, "settings": load_state()["settings"]})
         if u.path == "/api/upload":
-            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n < 0:
+                return self.json({"ok": False, "error": "bad upload"}, 400)
             if n > 20 * 1024 * 1024:
                 return self.json({"ok": False, "error": "picture is over 20 MB"})
             return self.json(save_upload(self.rfile.read(n), self.headers.get("Content-Type", "")))
-        if u.path == "/api/complete":
-            return self.json(set_complete(rel.strip("/"), q.get("on", ["1"])[0] == "1"))
-        if u.path == "/api/folder":
-            p = safe_path(rel)
-            if not p or not p.is_dir():
-                return self.json({"ok": False}, 400)
-            subprocess.Popen(["explorer", str(p)])
-            return self.json({"ok": True})
         if u.path == "/api/chat":
-            try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-            except ValueError:
+            if (body := self.body_json()) is None:
                 return self.json({"ok": False}, 400)
             msg = str(body.get("message", "")).strip()
             if not msg:
@@ -2344,7 +2570,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/chat/stop":
             p = _chat_proc
             if p and p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
+                _kill_tree(p)
             return self.json({"ok": True})
         if u.path == "/api/quit":
             self.json({"ok": True})
@@ -2354,13 +2580,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    from urllib.parse import quote
     url = f"http://127.0.0.1:{PORT}"
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    except OSError:  # already running: just open it
+    except OSError:  # already running: just open it (with the running server's key)
         if "--open" in sys.argv:
-            webbrowser.open(url)
+            webbrowser.open(f"{url}/?k={quote(read_key())}")
         return
+    init_key()  # only after the port is ours, so a second start doesn't replace the running server's key
     activate_profile(load_profiles()["active"])
     print(f"CAD Parts dashboard on {url}  (parts: {ROOT or 'not set up yet'})")
     if not MCP_NONE.is_file():
@@ -2370,7 +2598,7 @@ def main():
     threading.Thread(target=warm_worker, daemon=True).start()
     threading.Thread(target=claude_auth, kwargs={"force": True}, daemon=True).start()
     if "--open" in sys.argv:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.6, lambda: webbrowser.open(f"{url}/?k={quote(KEY)}")).start()
     srv.serve_forever()
 
 

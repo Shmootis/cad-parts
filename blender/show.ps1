@@ -14,8 +14,10 @@ Set-Content -LiteralPath (Join-Path $State "load.txt") -Value $full -Encoding ut
 $running = $null
 $pidFile = Join-Path $State "viewer.pid"
 if (Test-Path -LiteralPath $pidFile) {
-    $id = [int](Get-Content -LiteralPath $pidFile -Raw)
-    $running = Get-Process -Id $id -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq "blender" }
+    $id = 0   # an empty or corrupt viewer.pid just means "no viewer running"
+    if ([int]::TryParse(("" + (Get-Content -LiteralPath $pidFile -Raw -ErrorAction SilentlyContinue)).Trim(), [ref]$id) -and $id -gt 0) {
+        $running = Get-Process -Id $id -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq "blender" }
+    }
 }
 
 if ($running) {

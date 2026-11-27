@@ -1,6 +1,7 @@
 ; CAD Parts installer (Inno Setup 6). Build with build-release.ps1, which passes /DAppVersion=<version.json>.
 ; Per-user install: no admin rights, nothing outside the user's own folders.
-; The parts folders and profiles (%APPDATA%\CAD Parts) are never touched by install, upgrade or uninstall.
+; The parts folders and profiles (%APPDATA%\CAD Parts) are never touched by install, upgrade or uninstall
+; (uninstall only removes disposable caches: downloaded updates and icons, see [UninstallDelete]).
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -12,7 +13,8 @@ AppName=CAD Parts
 AppVersion={#AppVersion}
 AppVerName=CAD Parts {#AppVersion}
 AppPublisher=CAD Parts
-; no spaces in the install path: Claude's allowed build command is matched as plain text
+; no space in the app's own folder name (CADParts): Claude's allowed build command is matched as plain text.
+; The rest of the path ({localappdata}, i.e. the user's profile) may still contain spaces.
 DefaultDirName={localappdata}\Programs\CADParts
 DisableDirPage=yes
 DisableProgramGroupPage=yes
@@ -30,6 +32,9 @@ ArchitecturesAllowed=x64compatible
 ; the app window holds this mutex: setup asks to close CAD Parts before updating it
 AppMutex=Local\CADPartsWindow
 CloseApplications=yes
+; never let Restart Manager relaunch the app directly (it would inherit Setup's RedirectionGuard: uv's
+; os error 448); [Run] reopens it through explorer.exe instead
+RestartApplications=no
 
 [Messages]
 WelcomeLabel2=This installs CAD Parts {#AppVersion}: describe a part, Claude designs it with build123d, and you see it in 3D.%n%nOn first start CAD Parts checks for the free tools it uses (Claude Code, Git for Windows and a Python CAD engine) and helps install anything missing. You'll need your own Claude account.
@@ -45,7 +50,6 @@ Source: "app.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "app.css"; DestDir: "{app}"; Flags: ignoreversion
 Source: "run.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "cadworker.py"; DestDir: "{app}"; Flags: ignoreversion
-Source: "selftest.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "version.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "cadparts.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Start CAD Parts.cmd"; DestDir: "{app}"; Flags: ignoreversion
@@ -73,6 +77,10 @@ Filename: "{win}\explorer.exe"; Parameters: """{app}\CAD Parts.exe"""; Flags: no
 Type: files; Name: "{app}\mcp-none.json"
 Type: filesandordirs; Name: "{app}\__pycache__"
 Type: filesandordirs; Name: "{app}\blender\__pycache__"
+; disposable caches only (profiles, parts, logs, window.json and the page's webview storage stay)
+Type: filesandordirs; Name: "{userappdata}\CAD Parts\updates"
+Type: filesandordirs; Name: "{localappdata}\CAD Parts\icons"
+Type: filesandordirs; Name: "{localappdata}\CADPartsFrames"
 
 [Code]
 // Stop a running CAD Parts server (and its build worker) so updated files are used and nothing is locked.
@@ -82,7 +90,9 @@ var
 begin
   Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoProfile -WindowStyle Hidden -Command "try { Invoke-RestMethod -Method Post -TimeoutSec 5 http://127.0.0.1:8765/api/quit | Out-Null } catch {}; ' +
-    'Get-NetTCPConnection -LocalPort 8766 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }"',
+    'Start-Sleep -Seconds 1; ' +
+    // a hung old server (8765) or the build worker (8766) that is still listening: stop it
+    'Get-NetTCPConnection -LocalPort 8765,8766 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }"',
     '', SW_HIDE, ewWaitUntilTerminated, Rc);
 end;
 

@@ -1,13 +1,12 @@
 /* CAD Parts styles (the page is index.html, the code app.js) */
 /* dark, thin scrollbars (Firefox: scrollbar-color; app window/Chromium: ::-webkit-scrollbar) */
-:root{color-scheme:dark}
 *{scrollbar-width:thin;scrollbar-color:#3a3a37 transparent}
 ::-webkit-scrollbar{width:10px;height:10px;background:transparent}
 ::-webkit-scrollbar-thumb{background:#3a3a37;border-radius:999px;border:2px solid transparent;background-clip:padding-box}
 ::-webkit-scrollbar-thumb:hover{background:#4d4d49;background-clip:padding-box}
 ::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
 ::-webkit-scrollbar-button{display:none;height:0;width:0}
-:root{
+:root{color-scheme:dark;
   --bg:#121211; --surface:#1a1a19; --surface-2:#232321; --line:#2e2e2b;
   --ink:#f0efec; --ink-2:#c3c2b7; --muted:#898781;
   --accent:#3987e5; --good:#0ca30c; --thumb:#191918;
@@ -26,23 +25,14 @@ button.primary:hover{filter:brightness(1.08)}
 button:disabled{opacity:.4;cursor:default}
 header{height:56px;display:flex;align-items:center;gap:20px;padding:0 20px;
   border-bottom:1px solid var(--line);background:linear-gradient(180deg,#1d1d1c 0%,var(--surface) 100%);
-  box-shadow:0 1px 0 rgba(0,0,0,.35)}
+  box-shadow:0 1px 0 rgba(0,0,0,.35);position:relative}
 /* brand: small logo mark + wordmark */
 .brand{display:flex;align-items:center;gap:10px;font-family:"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;
   font-weight:650;font-size:16.5px;letter-spacing:-.1px;white-space:nowrap}
 .brand .mark{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;flex:none;
   background:linear-gradient(145deg,#3987e5 0%,#1c5cab 100%);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 1px 2px rgba(0,0,0,.4)}
 .brand .mark svg{width:17px;height:17px}
-.brand .sub{color:var(--muted);font-weight:400;padding-left:10px;margin-left:2px;border-left:1px solid #3a3a37}
-.stats{color:var(--ink-2)}
 .spacer{flex:1}
-.toggle{display:flex;align-items:center;gap:6px;color:var(--ink-2);cursor:pointer;user-select:none}
-.toggle input{accent-color:var(--accent)}
-.seg{display:flex}
-.seg button{border-radius:0}
-.seg button:first-child{border-radius:8px 0 0 8px}
-.seg button:last-child{border-radius:0 8px 8px 0;border-left:none}
-.seg button.on{background:#2c3a4d;border-color:#3d5878}
 main{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(400px,1fr);height:calc(100vh - 56px)}
 /* Home: parts list (fixed, 2 per row; can be closed) | viewer | slider | edit chat */
 /* Parts open: big list + viewer (chat hidden). Parts closed: viewer | slider | chat. */
@@ -75,10 +65,7 @@ body.resizing canvas{pointer-events:none}
 .newbtn{background:var(--good);border-color:var(--good);color:#fff;padding:6px 14px;border-radius:9px;font-weight:500;
   box-shadow:0 1px 2px rgba(0,0,0,.35);-webkit-font-smoothing:auto}
 .newbtn:hover{background:#13b813;border-color:#13b813}
-/* Recycle Bin: header button (far right) + drop-down panel */
-header{position:relative}
-.trashbtn{display:flex;align-items:center;gap:7px;background:#141413;color:var(--ink-2);padding:6px 12px;border-radius:9px}
-.trashbtn:hover,.trashbtn.on{color:var(--ink);border-color:#4a4a46;background:var(--surface-2)}
+/* Settings and Recycle Bin: drop-down panels under the header (opened from the profile menu) */
 .trashpanel{position:absolute;right:16px;top:52px;z-index:40;width:400px;max-height:min(70vh,560px);display:flex;flex-direction:column;
   background:#1c1c1b;border:1px solid #3a3a37;border-radius:12px;box-shadow:0 16px 40px rgba(0,0,0,.55)}
 .trashhead{display:flex;align-items:center;padding:10px 12px 10px 16px;border-bottom:1px solid var(--line)}
@@ -91,7 +78,6 @@ header{position:relative}
 .titem .sb{color:var(--muted);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .titem button{flex:none;font-size:12px;padding:4px 10px}
 .tempty{color:var(--muted);text-align:center;padding:26px 10px;font-size:13px}
-.vwrap canvas{width:100%!important;height:100%!important;display:block}
 
 /* chat */
 .chead{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}
@@ -99,8 +85,6 @@ header{position:relative}
 button.ghost{background:none;border-color:transparent;color:var(--ink-2);padding:4px 8px}
 button.ghost:hover{border-color:var(--line)}
 .cmsgs{flex:1;overflow:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
-.cmsgs .hint{color:var(--muted);font-size:13px;line-height:1.55;padding:6px 2px}
-.cmsgs .hint b{color:var(--ink-2);font-weight:500}
 .m{max-width:92%;font-size:13.5px;line-height:1.5}
 .m.user{align-self:flex-end;background:#2c3a4d;border:1px solid #3d5878;padding:8px 12px;border-radius:12px 12px 4px 12px;white-space:pre-wrap}
 .m.claude{align-self:flex-start;color:var(--ink)}
@@ -121,41 +105,25 @@ button.ghost:hover{border-color:var(--line)}
   border-radius:10px;padding:9px 11px;font:inherit;font-size:13.5px;outline:none}
 .cform textarea:focus{border-color:#3d5878}
 .crow{display:flex;align-items:center;gap:8px}
-.crow .toggle{font-size:12px}
 .chint{color:var(--muted);font-size:12px}
-/* Edit (top-right of the viewer): blue "Edit part" with a pencil opens the chat; while the chat is open it
-   turns into a plain "Back to parts" that brings the list back */
+/* Edit Part (top-right of the viewer, list screen only): blue, with a pencil; opens the chat */
 .vright{position:absolute;right:10px;top:8px;z-index:3;display:flex;align-items:center;gap:6px}
 .vedit{display:flex;align-items:center;gap:6px;border-radius:8px;
   padding:4px 12px 4px 10px;font-size:12.5px;font-weight:600;background:#1f6fd6;border-color:#1f6fd6;color:#fff;
   box-shadow:0 1px 3px rgba(0,0,0,.4)}
 .vedit:hover{background:#2a7be3;border-color:#2a7be3}
-.vedit.on{background:rgba(35,35,33,.9);border-color:#3a3a37;color:var(--ink)}
-.vedit.on:hover{background:var(--surface-2);border-color:#4a4a46}
 .vedit svg{flex:none}
 #viewer .vstatus{top:44px} /* under Reset view */
-.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line)}
-.tabs button{background:none;border:none;border-bottom:2px solid transparent;border-radius:0;
-  padding:8px 14px;color:var(--ink-2);margin-bottom:-1px}
-.tabs button:hover{color:var(--ink)}
-.tabs button.on{color:var(--ink);border-bottom-color:var(--accent)}
-.tabs .dotbusy{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-left:6px;vertical-align:2px;animation:blink 1.2s infinite}
 #tabDetails{display:flex;flex-direction:column;gap:12px;flex:none}
-.dhead{flex:none}
-.actions{flex-wrap:wrap}
-.actions button{white-space:nowrap}
 /* editing: the part's chat gets its own column on the far right */
 #tabEdit{display:flex;flex-direction:column;min-height:0;background:var(--surface)}
 .chead.sub{padding:4px 8px;border-bottom:none}
-.etitle{color:var(--ink-2);font-size:12.5px}
-.etitle b{color:var(--ink);font-weight:600}
 #left{min-width:0;min-height:0;overflow:auto;padding:16px 8px 24px 20px}
 
 /* cards */
 .group{margin:4px 0 22px}
 .group h3{margin:0 0 10px;font-size:12px;font-weight:600;color:var(--muted);
   text-transform:uppercase;letter-spacing:.7px;display:flex;align-items:center;gap:8px}
-.group h3 .n{background:rgba(57,135,229,.14);border-radius:999px;padding:0 7px;font-size:11px;color:#8fb8ef;font-weight:600}
 .group h3::after{content:"";flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent);margin-left:4px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;
@@ -172,35 +140,19 @@ button.ghost:hover{border-color:var(--line)}
 /* the new part being described: a card with no picture yet */
 .card.draft .thumb{background:repeating-linear-gradient(135deg,#1c1c1b 0 10px,#1f1f1e 10px 20px)}
 .card.draft .cname{color:var(--ink-2)}
-.thumb .badge{position:absolute;top:8px;right:8px;background:var(--good);color:#fff;font-size:11px;
-  font-weight:600;padding:2px 8px;border-radius:999px}
-.thumb .ver{position:absolute;left:8px;bottom:8px;background:rgba(18,18,17,.8);color:var(--ink-2);
-  font-size:11px;padding:2px 7px;border-radius:6px}
 .cbody{padding:10px 12px 12px;display:flex;flex-direction:column;gap:3px}
 .cname{font-weight:600;font-size:14px;text-transform:capitalize;line-height:1.3;letter-spacing:-.05px}
-.cmeta{color:var(--muted);font-size:12px;display:flex;gap:6px;flex-wrap:wrap}
-.cmeta .pr{color:var(--ink-2)}
 .cwhy{color:var(--muted);font-size:11.5px;line-height:1.35;margin-top:3px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .searchrow{position:sticky;top:0;z-index:2;background:var(--bg);padding:16px 0 12px;display:flex;gap:8px}
 .searchrow .search{flex:1;min-width:0}
-.search{height:36px}
-.search{width:100%;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:10px;
+.search{width:100%;height:36px;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:10px;
   padding:8px 12px;font:inherit;font-size:13.5px;outline:none}
 .search:focus{border-color:#3d5878}
 
-/* list */
-table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
-th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
-th{color:var(--muted);font-weight:500;font-size:12px;position:sticky;top:0;background:var(--surface)}
-tbody tr{cursor:pointer}
-tbody tr:hover{background:var(--surface-2)}
-tbody tr.sel{background:#22303f}
-td.num{text-align:right;font-variant-numeric:tabular-nums}
-td.cap{text-transform:capitalize}
 
 /* detail */
 #detail{overflow:auto;padding:16px 20px 24px 12px;display:flex;flex-direction:column;gap:12px}
-.dhead{display:flex;flex-direction:row;align-items:center;flex-wrap:wrap;gap:6px 10px;min-height:36px}
+.dhead{flex:none;position:relative;display:flex;flex-direction:row;align-items:center;flex-wrap:wrap;gap:6px 10px;min-height:36px}
 .dhead h2{margin:0;font-family:"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;font-size:22px;font-weight:650;
   letter-spacing:-.3px;text-transform:capitalize;line-height:1.2}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
@@ -211,8 +163,6 @@ td.cap{text-transform:capitalize}
 #viewer{position:relative;flex:0 0 auto;height:calc((100vh - 156px) * 0.66);min-height:260px;border-radius:var(--r);overflow:hidden;
   background:#141413;border:1px solid var(--line)}
 #viewer canvas{width:100%!important;height:100%!important;display:block}
-.dims{position:absolute;left:12px;top:10px;font-size:12px;color:var(--ink-2);
-  background:rgba(20,20,19,.8);padding:3px 8px;border-radius:6px;font-variant-numeric:tabular-nums}
 .vtools{position:absolute;left:10px;top:8px;display:flex;gap:6px}
 .vtools button{padding:3px 9px;font-size:12px;background:rgba(35,35,33,.85)}
 .vtools button.on{background:#2c3a4d;border-color:#3d5878}
@@ -227,20 +177,8 @@ td.cap{text-transform:capitalize}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(57,135,229,.6)}100%{box-shadow:0 0 0 8px rgba(57,135,229,0)}}
 .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
   color:var(--muted);text-align:center;padding:20px}
-.dfile{color:var(--ink-2);font-size:13px;word-break:break-all}
-.actions{display:flex;gap:8px}
-.vrow{display:flex;align-items:center;gap:8px;margin:4px 0;flex-wrap:wrap}
-.vrow .lbl{color:var(--muted);font-size:12px;min-width:84px}
 .vchip{font-size:12px;padding:3px 9px;border-radius:7px}
 .vchip.cur{background:var(--accent);border-color:var(--accent);color:#fff}
-.vchip.fin::after{content:" ✓";color:#8fe08f}
-.vchip.cur.fin::after{color:#fff}
-button.done{border-color:#1c5e1c;color:#8fe08f}
-button.done:hover{border-color:#2d8a2d}
-button.done.on{background:var(--good);border-color:var(--good);color:#fff}
-/* delete: quiet red, pushed to the end of the row */
-button.danger{color:#f0a0a0;border-color:#5e2a2a;margin-left:auto}
-button.danger:hover{background:#3a1d1d;border-color:#8a3a3a}
 /* delete part: trash icon on the card picture, shown on hover */
 .cdel{position:absolute;top:8px;left:8px;width:28px;height:28px;padding:0;display:grid;place-items:center;border-radius:8px;
   background:rgba(20,20,19,.82);border:1px solid #5e2a2a;color:#f0a0a0;opacity:0;transition:opacity .12s,background .12s}
@@ -251,24 +189,9 @@ button.danger:hover{background:#3a1d1d;border-color:#8a3a3a}
   font-size:11px;line-height:15px;text-align:center;background:#3a1d1d;border-color:#6b2c2c;color:#f0a0a0;z-index:1}
 .vitem:hover .vdel{display:block}
 .vdel:hover{background:#5e2a2a;color:#fff}
-.sect{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-top:6px}
-.notes{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:4px 16px;color:var(--ink-2)}
-.notes h3,.notes h4,.notes h5,.notes h6{color:var(--ink);margin:12px 0 4px;font-size:14px}
-.notes ul{margin:4px 0;padding-left:20px}
-.notes p{margin:6px 0}
-.notes code{background:var(--surface-2);padding:0 4px;border-radius:4px}
-.notesBox summary{cursor:pointer;color:var(--ink-2);padding:8px 12px;border:1px solid var(--line);
-  border-radius:var(--r);background:var(--surface);user-select:none;list-style:none;display:flex;align-items:center;gap:8px}
-.notesBox summary::-webkit-details-marker{display:none}
-.notesBox summary::before{content:"▸";color:var(--muted);transition:transform .15s}
-.notesBox[open] summary::before{transform:rotate(90deg)}
-.notesBox[open] summary{border-radius:var(--r) var(--r) 0 0;border-bottom-color:transparent}
-.notesBox .notes{border-top:none;border-radius:0 0 var(--r) var(--r)}
-.notesBox .vlist{padding:8px 12px}
-.notesBox .vcur{margin-left:auto;color:var(--muted);font-size:12px}
 .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#2c3a4d;
-  border:1px solid #3d5878;padding:8px 14px;border-radius:8px;z-index:50;display:flex;align-items:center;gap:14px}
-.toast button{padding:3px 12px;font-size:12.5px;font-weight:600;background:#3d5878;border-color:#4e6d92;color:#fff}
+  border:1px solid #3d5878;padding:8px 14px;border-radius:8px;z-index:95;display:flex;align-items:center;gap:14px;pointer-events:none}
+.toast button{pointer-events:auto;padding:3px 12px;font-size:12.5px;font-weight:600;background:#3d5878;border-color:#4e6d92;color:#fff}
 .offline button{margin-top:16px}
 .offline .chint{margin-top:10px;display:block}
 
@@ -279,9 +202,8 @@ button.danger:hover{background:#3a1d1d;border-color:#8a3a3a}
 #profMenu{right:16px;top:52px;min-width:280px}
 .menu .ptitle{padding:8px 10px 6px;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.6px}
 .menu button.prof{flex-wrap:wrap;row-gap:1px}
-.menu button.prof .pf{flex-basis:100%;order:2}
 .menu button.prof .pn{display:flex;gap:8px;align-items:center;font-weight:600}
-.menu button.prof .pf{color:var(--muted);font-size:11.5px;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.menu button.prof .pf{flex-basis:100%;order:2;color:var(--muted);font-size:11.5px;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .menu button.prof.missing .pf{color:#f0a0a0}
 /* first-run setup / add or edit a profile: a centred card over everything */
 .setup{position:fixed;inset:0;z-index:80;background:radial-gradient(ellipse at 50% 0%,#1b2532 0%,var(--bg) 60%);
@@ -290,7 +212,7 @@ button.danger:hover{background:#3a1d1d;border-color:#8a3a3a}
   padding:28px 30px 24px;box-shadow:0 24px 70px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:18px}
 .setupcard h1{margin:0;font-family:"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;font-size:24px;font-weight:650;letter-spacing:-.3px}
 .setupcard .sub{margin:-12px 0 0;color:var(--muted);font-size:13.5px}
-.setupcard .mark{width:40px;height:40px;border-radius:11px;display:grid;place-items:center;
+.setupcard .mark{align-self:center;width:40px;height:40px;border-radius:11px;display:grid;place-items:center;
   background:linear-gradient(145deg,#3987e5 0%,#1c5cab 100%)}
 .field{display:flex;flex-direction:column;gap:7px}
 .field > span{font-size:12.5px;font-weight:600;color:var(--ink-2)}
@@ -322,8 +244,6 @@ button.danger:hover{background:#3a1d1d;border-color:#8a3a3a}
 .citem .ci svg{display:block}
 .cbar{width:80%;height:4px;border-radius:2px;background:#262624;overflow:hidden;margin-top:2px}
 .cbar i{display:block;height:100%;background:var(--accent);border-radius:2px;transition:width .3s}
-.cbar.indef i{width:35%;animation:cbar 1.3s ease-in-out infinite}
-@keyframes cbar{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}
 .cpaste{display:flex;gap:6px;width:100%}
 .cpaste input{flex:1;min-width:0;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:7px;
   padding:5px 8px;font:inherit;font-size:12px;outline:none}
@@ -334,12 +254,10 @@ button.danger:hover{background:#3a1d1d;border-color:#8a3a3a}
 .citem.busy .ci{background:#1d2733;color:#8fb8ef}
 .citem .ct{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;align-items:center}
 .citem .ct b{font-size:13.5px;font-weight:600}
-.citem .ct b em{font-style:normal;font-weight:400;color:var(--muted);font-size:12px;margin-left:6px}
 .citem .ct small{color:var(--muted);font-size:12px}
 .citem button{flex:none;font-size:12.5px;padding:5px 12px}
 .cnote{color:var(--ink-2);font-size:12.5px;background:#1d2733;border:1px solid #33465f;border-radius:8px;padding:8px 11px;text-align:center}
 /* setup cards: logo, title and text centered */
-.setupcard .mark{align-self:center}
 .setupcard h1,.setupcard .sub{text-align:center}
 #checks .srow,#lost .srow{justify-content:center}
 .stbtns{display:flex;justify-content:center;gap:10px}
@@ -378,7 +296,6 @@ kbd{font:11.5px/1 "Segoe UI",system-ui,sans-serif;background:var(--surface-2);bo
 .card:hover .cfav,.cfav:focus-visible,.cfav.on{opacity:1}
 .cfav.on{color:#f2c14e;border-color:#5c4a1c}
 .cfav:hover{color:#f2c14e}
-/* sort + tag filter above the cards */
 /* categories: label by the part name, picker in the ⋯ menu, rename/remove on the group headings */
 .chip.catchip{cursor:pointer;color:#b9cbe6;border-color:#33465f;background:#1d2733}
 .chip.catchip:hover{border-color:#4e6d92}
@@ -406,7 +323,6 @@ button.dangerbtn:hover{background:#d94b4b;border-color:#d94b4b}
 /* Versions: an always-open panel under the viewer */
 .vpanel{padding:6px 2px 0}
 .vhead{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
-.vscroll{padding:4px 0 0}
 .vpieces{display:flex;gap:4px;overflow-x:auto;padding:2px 0 8px;margin-bottom:6px;border-bottom:1px solid var(--line);scrollbar-width:thin}
 .vpiece{flex:none;background:none;border:none;border-radius:7px;padding:4px 10px;font-size:12.5px;color:var(--ink-2);white-space:nowrap}
 .vpiece:hover{background:var(--surface-2);color:var(--ink)}
@@ -415,10 +331,9 @@ button.dangerbtn:hover{background:#d94b4b;border-color:#d94b4b}
 .vhistbtn{display:flex;align-items:center;gap:5px;background:none;border:none;padding:3px 8px;font-size:12px;color:var(--muted);border-radius:6px}
 .vhistbtn:hover{color:var(--ink);background:var(--surface-2)}
 .owdd{position:relative}
-.owbtn{display:flex;align-items:center;gap:7px}
+.owbtn{display:flex;align-items:center;gap:7px;height:32px;padding:0 12px;font-size:13px}
 .owbtn svg{color:var(--muted)}
 .owdd .owmenu{left:auto;right:0;top:40px;bottom:auto;min-width:220px;max-height:70vh;overflow:auto}
-.owbtn{height:32px;padding:0 12px;font-size:13px}
 .slbtn img{width:16px;height:16px;object-fit:contain}
 .owdd .owmenu .ptitle{padding:7px 10px 4px}
 .owapp{display:flex;align-items:center;gap:10px}
@@ -432,17 +347,14 @@ button.dangerbtn:hover{background:#d94b4b;border-color:#d94b4b}
 .sortbtn svg{color:var(--muted)}
 .sortmenu{right:0;top:42px;min-width:130px}
 .sortmenu button.cur{color:#8fb8ef}
-/* part title row: tags, star, ⋯ menu, rename box */
-.dhead{position:relative}
+/* part title row: category chip, ⋯ menu, rename box */
 .iconbtn{display:grid;place-items:center;width:32px;height:32px;padding:0;font-size:17px;line-height:1}
-#dFav.on{color:#f2c14e}
 .menu{position:absolute;right:0;top:40px;z-index:40;min-width:200px;padding:5px;background:#1c1c1b;border:1px solid #3a3a37;
   border-radius:10px;box-shadow:0 16px 40px rgba(0,0,0,.55)}
 .menu button{display:flex;width:100%;align-items:center;justify-content:space-between;gap:16px;background:none;border:none;
   border-radius:7px;padding:7px 10px;text-align:left;color:var(--ink)}
 .menu button:hover{background:var(--surface-2)}
 .menu button.red{color:#f0a0a0}
-.menu kbd{font-size:10.5px;padding:2px 5px}
 .menu hr{border:none;border-top:1px solid var(--line);margin:4px 2px}
 .menu .mi{display:flex;align-items:center;gap:10px}
 .menu .mic{flex:none;color:var(--muted)}
@@ -485,4 +397,4 @@ button.dangerbtn:hover{background:#d94b4b;border-color:#d94b4b}
 .lightbox{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;cursor:zoom-out}
 .lightbox img{max-width:92vw;max-height:92vh;border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
 .offline{position:fixed;inset:0;background:rgba(18,18,17,.92);display:flex;align-items:center;
-  justify-content:center;z-index:30;color:var(--ink-2);font-size:15px;text-align:center}
+  justify-content:center;z-index:85;color:var(--ink-2);font-size:15px;text-align:center}

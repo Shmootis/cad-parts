@@ -8,11 +8,12 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 // in your browser can't use the server. If the server restarted (new key), reload to pick up the new one.
 const TOKEN = document.querySelector('meta[name="cad-token"]')?.content || '';
 const rawFetch = window.fetch.bind(window);
+let appReloads = false; // Restart Server in the app: the app window reloads itself (with the new key), so the page mustn't
 window.fetch = async (url, opts = {}) => {
   const api = typeof url === 'string' && url.startsWith('/api/');
   if (api) opts = { ...opts, headers: { ...(opts.headers || {}), 'X-CAD-Token': TOKEN } };
   const r = await rawFetch(url, opts);
-  if (api && r.status === 403 && Date.now() - (+sessionStorage.getItem('cad-key-reload') || 0) > 10000) {
+  if (api && r.status === 403 && !appReloads && Date.now() - (+sessionStorage.getItem('cad-key-reload') || 0) > 10000) {
     const j = await r.clone().json().catch(() => ({}));
     if (j.error === 'blocked: token') { sessionStorage.setItem('cad-key-reload', Date.now()); location.reload(); }
   }
@@ -42,6 +43,12 @@ const GROUPS = [
   { label: 'Older',      max: Infinity },
 ];
 let data = null, sel = null, selFile = null;
+// one-time cleanup of settings older versions kept in this browser (and thumbnails from before they were per profile)
+if (!localStorage.getItem('cad-cleaned-v1')) {
+  for (const k of ['cad-tagf', 'cad-draft', 'cad-chat', 'cad-rightw', 'cad-tab', 'cad-chat-hidden', 'cad-view', 'cad-vers']) localStorage.removeItem(k);
+  for (const k of Object.keys(localStorage)) if (/^thumb:[^:]*$/.test(k)) localStorage.removeItem(k);
+  localStorage.setItem('cad-cleaned-v1', '1');
+}
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const pretty = n => n.replace(/[-_]+/g, ' ');
@@ -63,7 +70,6 @@ const seriesLabel = (p, name) => name === p.name ? 'Main'
 const fileLabel = f => (f.version != null ? 'v' + f.version : tc(pretty(f.series.split('_').pop())))
   + (f.version != null && f.desc ? ' ' + tc(f.desc.length <= 14 ? f.desc : f.desc.slice(0, 13) + '…') : '');
 const shortFile = (p, f) => { const s = seriesLabel(p, f.series); return (s === 'Main' ? '' : s + ' ') + fileLabel(f); };
-const mb = n => n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1e3)) + ' KB';
 const previewUrl = (p, f) => '/preview/' + encodeURIComponent(p.name) + '/' + encodeURIComponent(f.file);
 
 function toast(msg, opt = {}) {
@@ -81,10 +87,18 @@ $('offRestart').onclick = async () => {
   $('offRestart').disabled = true; $('offHint').textContent = 'Starting the server…';
   const ok = await api.start_server().catch(() => false);
   $('offRestart').disabled = false;
-  if (ok) location.reload(); else $('offHint').textContent = 'Couldn\'t start it. Close and reopen the CAD Parts app.';
+  // the app window reloads itself with the server's new key: a reload here would race it (and miss the key)
+  if (ok) { appReloads = true; $('offHint').textContent = 'Reopening…'; } else $('offHint').textContent = 'Couldn\'t start it. Close and reopen the CAD Parts app.';
 };
 // "Are you sure?" in the app's own style. Resolves true (confirmed) or false (Cancel, Esc, click outside).
-function askConfirm({ title, text = '', ok = 'Delete', no = 'Cancel', danger = true }) {
+// One at a time: a second question waits until the open one is answered.
+let askQueue = Promise.resolve();
+function askConfirm(opts) {
+  const p = askQueue.then(() => showAsk(opts));
+  askQueue = p.catch(() => {});
+  return p;
+}
+function showAsk({ title, text = '', ok = 'Delete', no = 'Cancel', danger = true }) {
   return new Promise(resolve => {
     const box = $('ask');
     $('askTitle').textContent = title; $('askText').textContent = text; $('askText').hidden = !text;
@@ -93,7 +107,8 @@ function askConfirm({ title, text = '', ok = 'Delete', no = 'Cancel', danger = t
     const done = v => { box.hidden = true; document.removeEventListener('keydown', key, true); resolve(v); };
     const key = e => {
       if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(false); }
-      else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); done(true); }
+      // Enter presses the focused button (OK unless you tabbed to Cancel)
+      else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); done(document.activeElement !== $('askNo')); }
     };
     document.addEventListener('keydown', key, true);
     $('askYes').onclick = () => done(true);
@@ -107,10 +122,18 @@ async function postJSON(url, body) {
 }
 
 // ---------- data ----------
+// Each request is numbered: a slow older answer never replaces newer data. The 4 s poll skips while one is out.
+load.seq = 0; load.applied = 0; load.inflight = 0; load.fails = 0;
 async function load() {
+  const my = ++load.seq;
   let d;
+  load.inflight++;
   try { d = await (await fetch('/api/parts', { cache: 'no-store' })).json(); }
-  catch {
+  catch { d = null; }
+  finally { load.inflight--; }
+  if (my < load.applied) return; // a newer answer is already on the page
+  if (d && !d.setup && !Array.isArray(d.parts)) d = null; // an error answer (e.g. 403/500 JSON) isn't a parts list
+  if (!d) {
     if (++load.fails >= 2) {
       $('offline').hidden = false;
       const api = window.pywebview && window.pywebview.api;
@@ -119,12 +142,13 @@ async function load() {
     }
     return;
   }
-  load.fails = 0; $('offline').hidden = true;
+  load.applied = my; load.fails = 0; $('offline').hidden = true;
   if (d.setup) { location.reload(); return; } // the profile was removed elsewhere: back to setup
   hidePending(d); // don't flash back something that's being deleted right now
   const changed = !data || d.sig !== data.sig;
   const was = data && sel && part(sel), prevNewest = was && was.newest ? was.newest.file : null;
   data = d;
+  if (changed) pruneThumbs();
   if (!load.migrated) { load.migrated = true; migrateOldBuild(); }
   const adopted = adoptDraft();
   if (sel === NEW) { /* still describing the new part: nothing saved yet */ }
@@ -191,10 +215,16 @@ function selectLatest() {
   const p = latestPart(), nf = p.newest ? p.newest.file : null;
   if (p.name !== sel || nf !== selFile) { sel = p.name; selFile = nf; loadModel(); }
 }
-function select(name, file, user = true) {
+let selGen = 0; // counts switches to another part (a rename finishing late checks it)
+function select(name, file) {
   const p = part(name);
   const f = file || (p && p.newest ? p.newest.file : null);
   const same = name === sel && f === selFile;
+  if (name !== sel) { // another part: its menus and unsent pictures belonged to the old one
+    selGen++;
+    $('pmenu').hidden = true; $('owMenu').hidden = true;
+    clearPending();
+  }
   sel = name; selFile = f;
   if (!same) loadModel();
   renderAll();
@@ -278,7 +308,6 @@ function searchParts(query, pool = data.parts) {
 // ---------- cards ----------
 // Date (newest first, in groups), Name (A–Z) or Category (one group per category, newest first inside)
 let sortMode = ['name', 'category'].includes(localStorage.getItem('cad-sort')) ? localStorage.getItem('cad-sort') : 'recent';
-localStorage.removeItem('cad-tagf');
 function paintSort() {
   $('sortLabel').textContent = { name: 'Name', category: 'Category' }[sortMode] || 'Date';
   $('sortMenu').querySelectorAll('button').forEach(b => b.classList.toggle('cur', b.dataset.v === sortMode));
@@ -362,13 +391,16 @@ function md(t) {
   return out.join('');
 }
 function renderDetail() {
-  const draft = sel === NEW;
+  const draft = sel === NEW, p = draft ? null : part(sel);
   $('tabDetails').hidden = draft;
   $('ein').placeholder = draft ? 'Describe a new part…' : 'What should change?';
-  $('dMenu').hidden = $('dRename').hidden = $('owWrap').hidden = draft;
-  if (draft) $('bSlicer').hidden = true;
-  if (draft) { $('dName').textContent = 'New Part'; $('dChips').innerHTML = ''; renderDetail.part = NEW; return; }
-  const p = part(sel); if (!p) return;
+  $('dMenu').hidden = $('owWrap').hidden = !p;
+  $('dRename').hidden = !p || !!$('dName').querySelector('input');
+  if (!p) { // the new part being described, or no part at all (e.g. the last one was just deleted)
+    $('bSlicer').hidden = true;
+    $('dName').textContent = draft ? 'New Part' : ''; $('dChips').innerHTML = ''; $('versions').innerHTML = '';
+    renderDetail.part = draft ? NEW : null; return;
+  }
   if (!$('dName').querySelector('input')) $('dName').textContent = pretty(p.name);
   if (!$('dChips').querySelector('input')) {
     $('dChips').innerHTML = (p.category ? `<button class="chip catchip" type="button" title="Change Category">${esc(p.category)}</button>` : '')
@@ -377,8 +409,6 @@ function renderDetail() {
   }
   const f = allFiles(p).find(x => x.file === selFile);
   renderOpenButtons(f);
-  // collapsible; stays open or closed (remembered) across parts and refreshes
-  const cur = allFiles(p).find(x => x.file === selFile);
   if (renderDetail.part !== p.name) showAllVers = false; // each part opens showing just its last 5
   // two lines: the pieces this part is made of (only when there's more than one), then the last 5 versions of the
   // piece you're looking at, oldest on the left, newest on the right. Clicking a piece shows its newest version.
@@ -395,7 +425,6 @@ function renderDetail() {
     + `</div></div>` : '';
   $('versions').querySelectorAll('.vpiece').forEach(bn => bn.onclick = () => select(p.name, bn.dataset.f));
   if ($('vAll')) $('vAll').onclick = () => { showAllVers = !showAllVers; renderDetail(); };
-  localStorage.removeItem('cad-vers');
   $('versions').querySelectorAll('.vchip').forEach(bn => bn.onclick = () => select(p.name, bn.dataset.f));
   $('versions').querySelectorAll('.vdel').forEach(bn => bn.onclick = e => { e.stopPropagation(); deleteItem(p.name, bn.dataset.f); });
   renderDetail.part = p.name;
@@ -465,10 +494,12 @@ function startRename() {
   const h = $('dName'), inp = Object.assign(document.createElement('input'), { className: 'dname-input', value: pretty(p.name) });
   h.replaceChildren(inp); inp.focus(); inp.select(); $('dRename').hidden = true;
   let done = false;
+  const gen = selGen; // clicking another card ends the rename (blur): then stay on the part you clicked
   const finish = async ok => {
     if (done) return; done = true;
     const to = inp.value.trim();
-    h.textContent = pretty(p.name); $('dRename').hidden = false;
+    if (selGen === gen) { h.textContent = pretty(p.name); $('dRename').hidden = false; }
+    else renderDetail(); // the title row now belongs to the part you clicked
     if (!ok || !to || to === pretty(p.name)) return;
     const r = await post(`/api/rename?path=${encodeURIComponent(p.name)}&to=${encodeURIComponent(to)}`);
     if (!r.ok) { toast('Couldn\'t rename: ' + (r.error || 'failed')); return; }
@@ -476,9 +507,11 @@ function startRename() {
     if (store['part:' + p.name]) { store['part:' + r.name] = store['part:' + p.name]; delete store['part:' + p.name]; }
     if (busyKey === 'part:' + p.name) busyKey = 'part:' + r.name;
     if (curTurn && curTurn.k === 'part:' + p.name) curTurn.k = 'part:' + r.name;
-    const keepFile = selFile && selFile.startsWith(p.name) ? r.name + selFile.slice(p.name.length) : selFile;
-    sel = r.name; selFile = keepFile; data.sig = ''; await load();
-    if (part(r.name)) select(r.name, keepFile && allFiles(part(r.name)).some(x => x.file === keepFile) ? keepFile : null);
+    const still = selGen === gen; // nothing else was selected meanwhile
+    const keepFile = still && selFile && selFile.startsWith(p.name) ? r.name + selFile.slice(p.name.length) : selFile;
+    if (still) { sel = r.name; selFile = keepFile; }
+    data.sig = ''; await load();
+    if (still && selGen === gen && part(r.name)) select(r.name, keepFile && allFiles(part(r.name)).some(x => x.file === keepFile) ? keepFile : null);
     toast('Renamed to ' + pretty(r.name));
   };
   inp.onkeydown = e => { if (e.key === 'Enter') finish(true); if (e.key === 'Escape') { e.stopPropagation(); finish(false); } };
@@ -494,10 +527,7 @@ async function duplicatePart() {
 }
 $('dName').ondblclick = () => startRename();
 $('dRename').onclick = () => startRename();
-$('dFav').onclick = () => sel && sel !== NEW && toggleFav(sel);
 const MI = {'star': '<svg class="mic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/></svg>',
-  'tag': '<svg class="mic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12.2V4.5a1 1 0 0 1 1-1h7.7l8.3 8.3a1.4 1.4 0 0 1 0 2l-6.7 6.7a1.4 1.4 0 0 1-2 0z"/><circle cx="8" cy="8" r="1.4"/></svg>',
-  'copy': '<svg class="mic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8.5" y="8.5" width="12" height="12" rx="2"/><path d="M15.5 8.5V5.5a2 2 0 0 0-2-2h-8a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h3"/></svg>',
   'trash': '<svg class="mic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13M10 11v6M14 11v6"/></svg>',
   'gear': '<svg class="mic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
   'folder': '<svg class="mic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>',
@@ -623,10 +653,7 @@ function renderOwMenu() {
 $('bOpenWith').onclick = e => {
   e.stopPropagation();
   const open = $('owMenu').hidden; closePanels();
-  if (open) {
-    renderOwMenu(); const m = $('owMenu'); m.style.left = ''; m.style.right = ''; m.hidden = false;
-    if (m.getBoundingClientRect().right > innerWidth - 8) { m.style.left = 'auto'; m.style.right = '0'; } // no room: open to the left
-  }
+  if (open) { renderOwMenu(); $('owMenu').hidden = false; } // opens to the left of the button's right edge (app.css)
 };
 $('owMenu').onclick = async e => {
   const id = e.target.closest('button')?.dataset.id; if (!id) return;
@@ -640,11 +667,9 @@ $('owMenu').onclick = async e => {
 };
 document.addEventListener('click', e => { if (!$('owMenu').hidden && !e.target.closest('.owdd')) $('owMenu').hidden = true; });
 function fillDefaultAppSettings() {
-  for (const [sid, kind] of [['sSlicer', 'slicer']]) {
-    const list = apps.apps.filter(a => a.kind === kind || a.kind === 'other');
-    $(sid).innerHTML = '<option value="none">None</option>' + list.map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
-    $(sid).value = apps.defaults[kind] || 'none';
-  }
+  const list = apps.apps.filter(a => a.kind === 'slicer' || a.kind === 'other');
+  $('sSlicer').innerHTML = '<option value="none">None</option>' + list.map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
+  $('sSlicer').value = apps.defaults.slicer || 'none';
 }
 async function saveDefaultApps() {
   const r = await postJSON('/api/apps/defaults', { slicer: $('sSlicer').value });
@@ -713,9 +738,23 @@ tRenderer.setSize(TW, TH, false);
 const tScene = new THREE.Scene(); addLights(tScene); setupRenderer(tRenderer, tScene);
 const tCam = new THREE.PerspectiveCamera(32, TW / TH, 0.1, 20000);
 const thumbKey = p => `4|${p.newest.file}|${p.newest.mtime}|${p.newest.size}`;
+const thumbStoreKey = name => `thumb:${profId}:${name}`; // per profile: two profiles can have parts with the same name
+const thumbMem = new Map(); // pictures that didn't fit in storage: still shown this session
 function thumbCached(p) {
-  try { const v = JSON.parse(localStorage.getItem('thumb:' + p.name) || 'null'); return v && v.k === thumbKey(p) ? v.url : null; }
+  const m = thumbMem.get(p.name); if (m && m.k === thumbKey(p)) return m.url;
+  try { const v = JSON.parse(localStorage.getItem(thumbStoreKey(p.name)) || 'null'); return v && v.k === thumbKey(p) ? v.url : null; }
   catch { return null; }
+}
+function saveThumb(p, url) {
+  const k = thumbStoreKey(p.name), v = JSON.stringify({ k: thumbKey(p), url });
+  try { localStorage.setItem(k, v); return; } catch { /* storage full: below */ }
+  // make room: drop other profiles' pictures, then try once more
+  for (const sk of Object.keys(localStorage)) if (sk.startsWith('thumb:') && !sk.startsWith(`thumb:${profId}:`)) localStorage.removeItem(sk);
+  try { localStorage.setItem(k, v); } catch { thumbMem.set(p.name, { k: thumbKey(p), url }); }
+}
+function pruneThumbs() { // pictures of this profile's parts that no longer exist
+  const pre = `thumb:${profId}:`, names = new Set(data.parts.map(p => p.name));
+  for (const sk of Object.keys(localStorage)) if (sk.startsWith(pre) && !names.has(sk.slice(pre.length))) localStorage.removeItem(sk);
 }
 const tQueue = []; let tBusy = false;
 function queueThumbs() {
@@ -737,8 +776,7 @@ async function pumpThumbs() {
       tRenderer.render(tScene, tCam);
       url = tRenderer.domElement.toDataURL('image/webp', 0.85);
       tScene.remove(holder); geo.dispose();
-      try { localStorage.setItem('thumb:' + p.name, JSON.stringify({ k: thumbKey(p), url })); }
-      catch { /* storage full: still show it this session */ }
+      saveThumb(p, url);
     } catch { url = null; }
     const slot = document.querySelector(`.thumb[data-t="${CSS.escape(p.name)}"]`);
     if (slot) {
@@ -844,10 +882,6 @@ function makeViewer(el, emptyEl) {
   let curPart = null;  // which part is on screen: new versions of the SAME part never move the camera
   let reveal = null;   // new version rising out of the plate: {t0, dur, h, plane, layer, ghost}
   let scan = null;     // soft layer sweeping while Claude works: {mesh, t0}
-  // construction-step playback (recorded by the CAD worker while the part script ran)
-  let seq = null;      // {steps:[{holder,label,grow,top,size}], k, t0, stepDur, ghost, plane, mat, edge, layer, part, run, onDone}
-  let seqDone = { part: null, at: -1e9 }; // when steps last finished, so the real file can swap in quietly
-  let flash = null;    // brief edge glow on the finished shape: {mat, t0, dur}
   let busyLabel = null;
   let finishedThisTurn = false; // the arrival finish already played during the current build
   const status = document.createElement('div'); status.className = 'vstatus'; status.hidden = true; el.appendChild(status);
@@ -856,7 +890,7 @@ function makeViewer(el, emptyEl) {
     renderer.setSize(r.width, r.height, false); camera.aspect = r.width / r.height; camera.updateProjectionMatrix();
   }).observe(el);
 
-  // a translucent accent "layer" plate (fill + glowing outline), used by the reveal, the scan and step growth
+  // a translucent accent "layer" plate (fill + glowing outline), used by the reveal and the scan
   function layerMesh(size, opacity) {
     const g = new THREE.Group();
     const geo = new THREE.PlaneGeometry(size.x * 1.12 + 2, size.z * 1.12 + 2); geo.rotateX(-Math.PI / 2);
@@ -895,147 +929,15 @@ function makeViewer(el, emptyEl) {
         }
       }
     }
-    if (seq) tickSeq(now);
-    if (flash) {
-      const t = Math.min(1, (now - flash.t0) / flash.dur);
-      flash.mat.color.copy(ACCENT).lerp(EDGE_COLOR, easeInOut(t)); flash.mat.opacity = 1 - .45 * t;
-      if (t >= 1) { if (holder) setEdgeMat(holder, edgeMat); flash.mat.dispose(); flash = null; }
-    }
-    if (scan && scan.mesh) {
-      // the generic sweep only while there's nothing real to show; hidden once construction steps play
-      scan.mesh.visible = !seq && now - seqDone.at > 120000;
+    if (scan && scan.mesh) { // the generic sweep
       const h = cur ? cur.size.y : 40, ph = ((now - scan.t0) / 2600) % 2, u = ph < 1 ? ph : 2 - ph; // up and down
       scan.mesh.position.y = easeInOut(u) * h * 1.05;
     }
   }
 
-  // ----- construction-step playback -----
-  const niceStep = l => l === 'final' ? 'Final shape' : l.startsWith('+ ') ? 'Add ' + l.slice(2).toLowerCase()
-    : l.startsWith('− ') ? 'Cut ' + l.slice(2).toLowerCase() : l.startsWith('∩ ') ? 'Intersect'
-    : l.startsWith('build ') ? (l.endsWith('subtract') ? 'Cut' : l.endsWith('intersect') ? 'Intersect' : 'Add')
-    : l[0].toUpperCase() + l.slice(1);
-  function makeGhost(h) { // previous stage: a faint blue body with glowing outlines, fading out
-    h.traverse(x => {
-      if (x.isMesh) x.material = new THREE.MeshBasicMaterial({ color: ACCENT, transparent: true, opacity: .1, depthWrite: false });
-      if (x.isLineSegments) x.material = new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: .75 });
-    });
-    return h;
-  }
-  // --- layer slicing: cut a step's real mesh into horizontal outlines, like a slicer's perimeters ---
-  const TRAIL = 7; // how many past layers stay visible below the build front
-  // the layer being printed is drawn on top in a strong blue; older layers fade and sit behind the surface
-  const layerMats = Array.from({ length: TRAIL + 1 }, (_, i) => new THREE.LineBasicMaterial({
-    color: i === 0 ? new THREE.Color('#4da3ff') : new THREE.Color('#2f7fe0'), transparent: true, depthWrite: false,
-    depthTest: i !== 0, opacity: i === 0 ? 1 : .8 * (1 - i / (TRAIL + 1)) }));
-  function buildSlices(h, bottom, top) {
-    const mesh = []; h.traverse(x => x.isMesh && mesh.push(x)); if (!mesh.length) return null;
-    const m = mesh[0], pos = m.geometry.attributes.position, nTri = pos.count / 3;
-    if (nTri > 300000 || top - bottom < 0.5) return null; // very heavy meshes: skip the outlines
-    h.updateMatrixWorld(true);
-    const N = Math.max(24, Math.min(72, Math.round((top - bottom) / 0.8))), dh = (top - bottom) / N;
-    const segs = Array.from({ length: N }, () => []), v = new THREE.Vector3(), P = new Float32Array(pos.count * 3);
-    for (let i = 0; i < pos.count; i++) { v.fromBufferAttribute(pos, i).applyMatrix4(m.matrixWorld); P[i * 3] = v.x; P[i * 3 + 1] = v.y; P[i * 3 + 2] = v.z; }
-    // nudge outlines ~0.6% away from the part's centre so they sit just outside the surface
-    const bb = new THREE.Box3().setFromBufferAttribute(new THREE.BufferAttribute(P, 3)), cx = (bb.min.x + bb.max.x) / 2, cz = (bb.min.z + bb.max.z) / 2, grow = 1.006;
-    for (let t = 0; t < nTri; t++) {
-      const a = t * 9, ya = P[a + 1], yb = P[a + 4], yc = P[a + 7];
-      const lo = Math.min(ya, yb, yc), hi = Math.max(ya, yb, yc);
-      let j0 = Math.max(0, Math.ceil((lo - bottom) / dh - .5)), j1 = Math.min(N - 1, Math.floor((hi - bottom) / dh - .5));
-      for (let j = j0; j <= j1; j++) {
-        const y = bottom + (j + .5) * dh, out = segs[j]; let found = 0;
-        for (const [p, q] of [[a, a + 3], [a + 3, a + 6], [a + 6, a]]) {
-          const y1 = P[p + 1] - y, y2 = P[q + 1] - y;
-          if ((y1 < 0) !== (y2 < 0)) { const f = y1 / (y1 - y2); out.push(cx + (P[p] + (P[q] - P[p]) * f - cx) * grow, y + .05, cz + (P[p + 2] + (P[q + 2] - P[p + 2]) * f - cz) * grow); found++; }
-        }
-        if (found === 1) out.length -= 3; // touching at a vertex: no segment
-      }
-    }
-    const g = new THREE.Group();
-    const lines = segs.map(s => { const bg = new THREE.BufferGeometry(); bg.setAttribute('position', new THREE.Float32BufferAttribute(s, 3));
-      const l = new THREE.LineSegments(bg, layerMats[0]); l.visible = false; l.renderOrder = 3; g.add(l); return l; });
-    return { group: g, lines, bottom, dh, N };
-  }
-
-  function enterStep(k) {
-    const s = seq.steps[k], prev = k > 0 ? seq.steps[k - 1] : null, n = seq.steps.length;
-    if (seq.ghost) { scene.remove(seq.ghost); disposeTree(seq.ghost); seq.ghost = null; } // the ghost two steps back is done
-    if (prev) { seq.ghost = makeGhost(prev.holder); } // what a cut removes stays visible briefly as a blue outline
-    if (seq.mat) seq.mat.dispose(); if (seq.edge) seq.edge.dispose();
-    if (seq.layer) { scene.remove(seq.layer); disposeTree(seq.layer); seq.layer = null; }
-    if (seq.slices) { scene.remove(seq.slices.group); seq.slices.group.traverse(x => x.geometry && x.geometry.dispose()); seq.slices = null; }
-    seq.plane = new THREE.Plane(new THREE.Vector3(0, -1, 0), s.grow ? s.bottom : 1e6);
-    seq.mat = mat.clone(); seq.mat.emissive = ACCENT.clone(); seq.mat.emissiveIntensity = .5;
-    seq.mat.clippingPlanes = [seq.plane]; seq.mat.side = THREE.DoubleSide;
-    seq.edge = new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 1, clippingPlanes: [seq.plane] });
-    setMeshMat(s.holder, seq.mat); setEdgeMat(s.holder, seq.edge);
-    scene.add(s.holder);
-    if (s.grow) {
-      seq.layer = layerMesh(s.size, .05); scene.add(seq.layer); // faint plate at the build front
-      seq.slices = buildSlices(s.holder, s.bottom, s.top);       // glowing layer outlines, printed bottom-up
-      if (seq.slices) scene.add(seq.slices.group);
-    }
-    const pct = Math.round(((k + 1) / n) * 100);
-    setStatus(`<span>Step ${k + 1}/${n} · ${plain(niceStep(s.label))}</span><span class="vbar"><i style="width:${pct}%"></i></span>`);
-  }
-  function tickSeq(now) {
-    const el = now - seq.t0, n = seq.steps.length;
-    let k = 0; while (k < n && el >= seq.steps[k].end) k++;
-    if (k >= n) return finishSeq();
-    if (k !== seq.k) { for (let j = seq.k + 1; j <= k; j++) enterStep(j); seq.k = k; }
-    const s = seq.steps[k], t = Math.min(1, (el - s.start) / (s.end - s.start)), e = easeInOut(t);
-    if (s.grow) {
-      const g = Math.min(1, t / .8), y = s.bottom + (s.top - s.bottom) * 1.01 * g; // grows at a steady, printer-like pace
-      seq.plane.constant = y;
-      if (seq.layer) { seq.layer.position.y = y; seq.layer.children.forEach(c => c.material.opacity = (c.isLineSegments ? .5 : .05) * (t < .8 ? 1 : (1 - t) / .2)); }
-      if (seq.slices) { // the layer being "printed" glows bright; the ones below fade out behind it
-        const S = seq.slices, front = Math.min(S.N - 1, Math.floor((y - S.bottom) / S.dh)), fade = t < .8 ? 1 : (1 - t) / .2;
-        for (let j = 0; j < S.N; j++) {
-          const d = front - j, l = S.lines[j];
-          l.visible = d >= 0 && d <= TRAIL && fade > 0;
-          if (l.visible) l.material = layerMats[d];
-        }
-        layerMats.forEach((m, i) => m.opacity = (i === 0 ? 1 : .8 * (1 - i / (TRAIL + 1))) * fade);
-      }
-    }
-    seq.mat.emissiveIntensity = .5 * (1 - e);
-    seq.edge.color.copy(ACCENT).lerp(EDGE_COLOR, e); seq.edge.opacity = 1 - .45 * e; // new edges glow, then settle
-    if (seq.ghost) seq.ghost.traverse(x => { if (x.isMesh) x.material.opacity = .1 * (1 - t); if (x.isLineSegments) x.material.opacity = .75 * (1 - e); });
-  }
-  function dropSlices() {
-    if (seq.slices) { scene.remove(seq.slices.group); seq.slices.group.traverse(x => x.geometry && x.geometry.dispose()); seq.slices = null; }
-  }
-  function finishSeq() {
-    const last = seq.steps[seq.steps.length - 1];
-    if (seq.ghost) { scene.remove(seq.ghost); disposeTree(seq.ghost); }
-    if (seq.layer) { scene.remove(seq.layer); disposeTree(seq.layer); }
-    dropSlices();
-    for (const s of seq.steps) if (s !== last) { scene.remove(s.holder); disposeTree(s.holder); }
-    setMeshMat(last.holder, mat);
-    if (seq.mat) seq.mat.dispose(); if (seq.edge) seq.edge.dispose();
-    holder = last.holder; // the final stage stays on screen until the real file arrives
-    // finishing touch: the whole part's edges glow blue once, then settle
-    const fm = new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 1 }); setEdgeMat(holder, fm);
-    flash = { mat: fm, t0: performance.now(), dur: 900 };
-    seqDone = { part: seq.part, at: performance.now() };
-    const done = seq.onDone; seq = null;
-    setStatus(busyLabel ? plain(busyLabel) : '');
-    if (done) done();
-  }
-  function stopSeq() { // abandon a playing sequence (e.g. the user opened another part)
-    if (!seq) return;
-    if (seq.ghost) { scene.remove(seq.ghost); disposeTree(seq.ghost); }
-    if (seq.layer) { scene.remove(seq.layer); disposeTree(seq.layer); }
-    dropSlices();
-    for (const s of seq.steps) { scene.remove(s.holder); disposeTree(s.holder); }
-    if (seq.mat) seq.mat.dispose(); if (seq.edge) seq.edge.dispose();
-    seq = null; setStatus(busyLabel ? plain(busyLabel) : '');
-  }
-
   renderer.setAnimationLoop(now => { if (!el.offsetParent) return; tick(now); controls.update(); renderer.render(scene, camera); });
   const empty = msg => { emptyEl.textContent = msg; emptyEl.hidden = !msg; };
   function clearModel(keepHolder) {
-    stopSeq();
-    if (flash) { flash.mat.dispose(); flash = null; }
     if (reveal) {
       if (reveal.ghost) { scene.remove(reveal.ghost); disposeTree(reveal.ghost); }
       if (reveal.layer) { scene.remove(reveal.layer); disposeTree(reveal.layer); }
@@ -1067,7 +969,7 @@ function makeViewer(el, emptyEl) {
     // questions only shows the pill, so the rig never starts and then stops for a clarifying question.
     setBusy(label, rig = false) {
       busyLabel = label;
-      if (!seq) setStatus(label ? plain(label) : '');
+      setStatus(label ? plain(label) : '');
       if (!label) finishedThisTurn = false;           // the build is over: the next one may play its finish again
       const on = !!label && rig && !finishedThisTurn;  // once the part has arrived, the rig stays off for this build
       if (on && !hud.target) buildHud();
@@ -1081,52 +983,16 @@ function makeViewer(el, emptyEl) {
       home = { pos: new THREE.Vector3(150, 120, 190), target: new THREE.Vector3(0, 0, 0) };
       camera.near = 1; camera.far = 5000; camera.updateProjectionMatrix(); reset();
     },
-    // Play a part's recorded construction steps (manifest from /api/frames) on the real geometry.
-    async playFrames(m) {
-      if (seq && seq.run === m.run) return;
-      const my = ++token;
-      const urls = m.frames.map(f => `/frames/${encodeURIComponent(m.part)}/${m.run}/${f.file}`);
-      const geos = await Promise.all(urls.map(u => new STLLoader().loadAsync(u).catch(() => null)));
-      if (my !== token || geos.some(g => !g)) { geos.forEach(g => g && g.dispose()); return; }
-      // every step is placed with the FINAL shape's offset, so the stages line up exactly
-      const last = placeOnFloor(geos[geos.length - 1]), off = last.holder.position.clone();
-      const steps = geos.map((g, i) => {
-        let h = last.holder;
-        if (i < geos.length - 1) {
-          h = new THREE.Group(); const inner = new THREE.Group(); inner.rotation.x = -Math.PI / 2;
-          inner.add(new THREE.Mesh(g, mat)); const e = edgesFor(g); if (e) inner.add(e);
-          h.add(inner); h.position.copy(off);
-        }
-        h.updateMatrixWorld(true);
-        const b = new THREE.Box3().setFromObject(h), sz = b.getSize(new THREE.Vector3());
-        const l = m.frames[i].label;
-        return { holder: h, label: l, top: b.max.y, bottom: b.min.y, size: sz, grow: i === 0 || /^(\+|extrude|revolve|loft|sweep|thicken|build add)/.test(l) };
-      });
-      const keepCam = !!cur && curPart === m.part; // edits to the part on screen never move your view
-      clearModel(); empty(''); shown = `steps:${m.run}`;
-      const { size, maxD } = last; cur = { size, maxD }; curPart = m.part;
-      setStage(size, maxD);
-      if (!keepCam) reset();
-      if (scan) restartScan();
-      // adaptive pace: layer-printed steps get more time than cuts; the whole build plays in 3–6 s
-      { const w = steps.map(s => s.grow ? 1 : .55), W = w.reduce((a, b) => a + b, 0), total = Math.max(3000, Math.min(6000, W * 1150));
-        let t = 0; steps.forEach((s, i) => { s.start = t; t += Math.max(400, total * w[i] / W); s.end = t; }); }
-      seq = { steps, k: -1, t0: performance.now(), ghost: null, plane: null, mat: null, edge: null, layer: null, slices: null, part: m.part, run: m.run };
-    },
     // animate: true when a NEW version of a part arrives. The camera only moves when a different part is opened.
     async show(p, f, { animate = false } = {}) {
       const key = `${p.name}/${f.file}|${f.mtime}`;
       if (key === shown) return;
-      // its construction steps just played (or are playing): swap the real file in quietly, no second build-up
-      const afterSteps = animate && ((seq && seq.part === p.name) || (seqDone.part === p.name && performance.now() - seqDone.at < 120000));
-      if (afterSteps && seq) { seq.onDone = () => this.show(p, f, { animate }); return; } // let the steps finish first
       const samePart = !!cur && curPart === p.name;
-      if (afterSteps) animate = false;
       // the finish plays once per build: further versions saved in the same build swap in quietly
       const quiet = animate && finishedThisTurn && samePart;
       if (quiet) animate = false;
       shown = key; const my = ++token;
-      if (!animate && !afterSteps && !quiet) { clearModel(); empty('Loading…'); }
+      if (!animate && !quiet) { clearModel(); empty('Loading…'); }
       let geo;
       try { geo = await new STLLoader().loadAsync(previewUrl(p, f)); }
       catch { if (my === token) empty("Couldn't load this file"); return; }
@@ -1146,7 +1012,7 @@ function makeViewer(el, emptyEl) {
       const placed = placeOnFloor(geo); holder = placed.holder; scene.add(holder);
       const { size, maxD } = placed; cur = { size, maxD }; curPart = p.name;
       setStage(size, maxD);
-      if (!(samePart && (animate || afterSteps || quiet))) reset(); // same part, new version: leave the view exactly as it is
+      if (!(samePart && (animate || quiet))) reset(); // same part, new version: leave the view exactly as it is
       if (scan) restartScan();
       if (hud.target) buildHud(); // re-fit the rig to this version
       if (animate) {
@@ -1164,8 +1030,6 @@ function makeViewer(el, emptyEl) {
   };
 }
 const homeViewer = makeViewer($('viewer'), $('vEmpty'));
-// debug hook: __cad.busy('Building…') shows the working animation on the viewer
-window.__cad = { busy: (label, rig = true) => homeViewer.setBusy(label, rig) };
 function loadModel(opts) {
   const p = part(sel), f = p && allFiles(p).find(x => x.file === selFile);
   if (f) homeViewer.show(p, f, opts); else homeViewer.clear(p ? 'No Model Yet' : '');
@@ -1185,14 +1049,12 @@ function renderAll() {
 // ---------- setup checklist: what this PC needs for the app to work (Claude Code + sign-in, Git) ----------
 // On a PC that hasn't passed it yet, this runs before anything else is drawn, so the home screen never flashes
 // behind it. The CAD engine (Python + build123d) installs itself; it's only mentioned while it's busy or if it failed.
-let tools = {}; // { blender: bool, bambu: bool }: hides those buttons when the apps aren't installed
 let health = null, healthPoll = null, checksResolve = null;
 const chk = id => (health && health.checks.find(c => c.id === id)) || {};
 const coreReady = () => !!(chk('claude').ok && chk('signin').ok && chk('git').ok);
 async function fetchHealth(force) {
   try { health = await (await fetch('/api/health' + (force ? '?force=1' : ''), { cache: 'no-store' })).json(); }
   catch { return null; }
-  tools = health.tools || {};
   if (coreReady()) localStorage.setItem('cad-setup-ok', '1');
   $('sHealthInfo').textContent = coreReady() ? 'All set' : 'Something needs attention';
   if (data) renderDetail();
@@ -1318,7 +1180,7 @@ catch { // server not running: show the banner (with Restart in the app) and rel
   $('offline').hidden = false;
   const api = window.pywebview && window.pywebview.api;
   $('offRestart').hidden = !(api && api.start_server);
-  setInterval(async () => { try { if ((await fetch('/api/ping', { cache: 'no-store' })).ok) location.reload(); } catch { /* still down */ } }, 2000);
+  setInterval(async () => { try { if (!appReloads && (await fetch('/api/ping', { cache: 'no-store' })).ok) location.reload(); } catch { /* still down */ } }, 2000);
   await new Promise(() => {});
 }
 const RESIN = /photon|saturn|mars|halot|sonic|form ?[0-9]|resin|jupiter|uniformation/i;
@@ -1374,7 +1236,7 @@ function renderFolders(opts, chosenId) {
   return choose;
 }
 async function openProfileForm(mode, prof) { // mode: 'first' | 'add' | 'edit'
-  closePanels && closePanels();
+  closePanels();
   $('setup').hidden = false; $('pfErr').textContent = '';
   $('setupTitle').textContent = mode === 'first' ? 'Welcome to CAD Parts' : mode === 'add' ? 'Add a Profile' : 'Edit Profile';
   $('setupSub').textContent = mode === 'first' ? 'Tell it who you are and where your parts should live. You can change this later.'
@@ -1458,37 +1320,43 @@ async function firstStart() {
   const err = t => { $('stErr').textContent = t; };
   const busy = on => $('start').querySelectorAll('button').forEach(b => b.disabled = on);
   const plural = n => `${n} part${n === 1 ? '' : 's'}`;
+  let saveErr = ''; // a failed save in steps 1 or 2 stays visible on the next screen
   const save = async (body, after) => {
     busy(true);
     const r = await postJSON('/api/profile/save', { id: null, ...body });
     busy(false);
-    if (!r.ok) { err('Couldn\'t set that up: ' + (r.error || 'failed')); return false; }
+    if (!r.ok) { saveErr = 'Couldn\'t set that up: ' + (r.error || 'failed'); err(saveErr); return false; }
     if (after) after(r);
     location.reload(); await new Promise(() => {});
   };
+  // the server didn't answer: say so, with Look Again, instead of waiting forever
   const look = async force => {
-    show('Looking for Your Parts…'); $('stAsk').hidden = $('stNew').hidden = true;
-    return (await fetch('/api/profile/find' + (force ? '?force=1' : ''), { cache: 'no-store' })).json().catch(() => ({}));
+    for (;;) {
+      show('Looking for Your Parts…'); $('stAsk').hidden = $('stNew').hidden = $('stFail').hidden = true;
+      try { return await (await fetch('/api/profile/find' + (force ? '?force=1' : ''), { cache: 'no-store' })).json(); }
+      catch { /* below */ }
+      show('Couldn\'t Look for Your Parts'); err('CAD Parts isn\'t answering. Try again in a moment.');
+      $('stFail').hidden = false;
+      await new Promise(res => { $('stRetry').onclick = res; });
+    }
   };
   let f = await look(false);
-  for (;;) {
-    if (f.match) { // 1) yours: open straight away
-      const m = f.match;
-      await save({ name: m.name || f.name || 'Me', folder: m.folder }, () => sessionStorage.setItem('cad-welcome', JSON.stringify(m)));
-    }
-    if (f.candidate) { // 2) are these yours?
-      const c = f.candidate;
-      show('Are These Your Parts?', `${plural(c.parts)} in ${c.folder}`);
-      $('stAsk').hidden = false;
-      const yes = await new Promise(res => { $('stUse').onclick = () => res(true); $('stNotMine').onclick = () => res(false); });
-      $('stAsk').hidden = true;
-      if (yes) await save({ name: c.name || f.name || 'Me', folder: c.folder }, () => sessionStorage.setItem('cad-welcome', JSON.stringify(c)));
-    }
-    break;
+  if (f.match) { // 1) yours: open straight away
+    const m = f.match;
+    await save({ name: m.name || f.name || 'Me', folder: m.folder }, () => sessionStorage.setItem('cad-welcome', JSON.stringify(m)));
+  }
+  if (f.candidate) { // 2) are these yours?
+    const c = f.candidate;
+    show('Are These Your Parts?', `${plural(c.parts)} in ${c.folder}`);
+    $('stAsk').hidden = false;
+    const yes = await new Promise(res => { $('stUse').onclick = () => res(true); $('stNotMine').onclick = () => res(false); });
+    $('stAsk').hidden = true;
+    if (yes) await save({ name: c.name || f.name || 'Me', folder: c.folder }, () => sessionStorage.setItem('cad-welcome', JSON.stringify(c)));
   }
   // 3) let's get your parts
   const sug = f.suggest || {};
   show('Let\'s Get Your Parts', sug.synced ? `New parts go in ${sug.label}, so they follow you to a new PC` : `New parts go in ${sug.label}`);
+  if (saveErr) err(saveErr);
   $('stSub').title = sug.folder;
   $('stNew').hidden = false;
   $('stName').value = f.name || '';
@@ -1542,7 +1410,6 @@ document.body.classList.remove('booting');
   if (sk) setTimeout(() => toast('Already in this folder, so not imported: ' + sk), 600);
 }
 draftOpen = localStorage.getItem('cad-draft:' + profId) === '1';
-localStorage.removeItem('cad-draft');
 
 const store = {};
 let diskChats = {};
@@ -1567,9 +1434,8 @@ let settings = { model: '', keep: 5, printer: '', notify: true };
 try { settings = await (await fetch('/api/settings', { cache: 'no-store' })).json(); } catch { /* defaults */ }
 let busyKey = null;
 let busyStatus = null, busyBuilding = false, lastTurnEnd = 0; // what Claude is doing now (shown on the viewer); when the last turn ended
-localStorage.removeItem('cad-chat'); // old single-chat history
 
-function makeChat({ msgs, form, input, sendBtn, clearBtn, key, context, hint, onSend, onClear }) {
+function makeChat({ msgs, form, input, sendBtn, clearBtn, key, context, onSend, onClear }) {
   const self = {
     render(forceBottom) {
       const k = key(); if (!k) return;
@@ -1582,7 +1448,7 @@ function makeChat({ msgs, form, input, sendBtn, clearBtn, key, context, hint, on
         if (m.role === 'warn') return `<div class="m warn">${esc(m.text)}</div>`;
         if (m.role === 'err') return `<div class="m err">${esc(m.text)}</div>`;
         return `<div class="m note">${esc(m.text)}</div>`;
-      }).join('') + (busy ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : hint();
+      }).join('') + (busy ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : '';
       if (atBottom || busy || forceBottom) box.scrollTop = box.scrollHeight;
       const other = busyKey && !busy;
       $(sendBtn).textContent = busy ? 'Stop' : 'Send';
@@ -1675,7 +1541,6 @@ const editChat = makeChat({
   // a new part: remember when this message started, so the folder Claude saves can be matched to the draft
   onSend: () => { if (sel === NEW) { const c = getChat('new'); c.turnStart = data ? data.now : Date.now() / 1000; saveChat('new'); } },
   onClear: () => $('ein').focus(),
-  hint: () => '',
 });
 
 // ---------- parts list: open (2 per row) or closed ----------
@@ -1713,7 +1578,6 @@ addEventListener('keydown', e => {
 });
 setList(localStorage.getItem('cad-list') !== 'closed');
 setList.ready = true;
-localStorage.removeItem('cad-rightw'); localStorage.removeItem('cad-tab'); // old settings
 
 // ---------- slider between the 3D viewer and the edit chat ----------
 (() => {
@@ -1753,6 +1617,11 @@ function renderPending() {
   $('eAtts').innerHTML = pending.map((it, i) => `<div class="att"><img src="${it.url}" alt=""><button type="button" data-i="${i}" title="Remove">×</button></div>`).join('');
   $('eAtts').querySelectorAll('button').forEach(b => b.onclick = () => { const [it] = pending.splice(+b.dataset.i, 1); URL.revokeObjectURL(it.url); renderPending(); });
 }
+function clearPending() { // switching parts: pictures not sent yet are dropped (they were for the other part)
+  if (!pending.length) return;
+  for (const it of pending.splice(0)) URL.revokeObjectURL(it.url);
+  renderPending();
+}
 $('eAttach').onclick = () => $('eFile').click();
 $('eFile').onchange = () => { addPictures([...$('eFile').files]); $('eFile').value = ''; };
 $('ein').addEventListener('paste', e => {
@@ -1781,7 +1650,7 @@ function openSettings(force) {
   $('sPrinter').value = settings.printer || ''; $('sNotify').checked = settings.notify !== false;
   fillDefaultAppSettings(); loadApps().then(() => { if (!$('settings').hidden) fillDefaultAppSettings(); });
   $('sProfInfo').textContent = (settings.printers || []).map(x => x.name).join(', ') || 'no printers listed';
-  panel.hidden = false; $('bSet').classList.add('on');
+  panel.hidden = false;
 }
 async function saveSettings() {
   const body = { model: $('sModel').value, keep: Math.max(1, Math.min(50, +$('sKeep').value || 5)), printer: $('sPrinter').value, notify: $('sNotify').checked };
@@ -1828,9 +1697,13 @@ $('sExport').onclick = async () => {
   const r = await post('/api/export?' + (dest ? 'dest=' + encodeURIComponent(dest) : 'name=' + encodeURIComponent(name)));
   if (!r.ok) { toast('Couldn\'t export: ' + (r.error || 'failed')); return; }
   const b = $('sExport'), info = $('sExportInfo'), was = info.textContent; b.disabled = true;
+  let misses = 0; // the server stopped or restarted (it forgets the job): give up after a few tries
   for (;;) {
     await new Promise(res => setTimeout(res, 400));
-    const j = await (await fetch('/api/job?what=export', { cache: 'no-store' })).json().catch(() => ({}));
+    let j = null;
+    try { j = await (await fetch('/api/job?what=export', { cache: 'no-store' })).json(); } catch { /* below */ }
+    if (!j || !j.state) { if (++misses >= 5) { info.textContent = 'Export stopped'; break; } continue; }
+    misses = 0;
     if (j.state === 'failed') { info.textContent = 'Export failed: ' + (j.error || ''); break; }
     if (j.state === 'done') { info.textContent = was; toast('Saved ' + j.url); break; }
     info.textContent = `Packing your parts… ${Math.round((j.pct || 0) * 100)}%`;
@@ -1841,26 +1714,35 @@ $('sExport').onclick = async () => {
 // ---------- updates: checked each time the app opens and every 3 hours while it's open. A new version downloads
 // quietly in the background; once it's ready (and checked), the app asks: Update Now, or Later (asked again next time).
 $('sUpdate').onclick = startUpdate;
-let updateAsked = '';
-async function checkUpdate(fresh) {
-  let v; try { v = await (await fetch('/api/version' + (fresh ? '?fresh=1' : ''), { cache: 'no-store' })).json(); } catch { return; }
-  $('sVersion').textContent = 'Version ' + v.version + (v.ready ? ` · ${v.latest} is ready to install` : v.newer ? ` · ${v.latest} is available` : v.latest ? ' · up to date' : '');
+let updateAsked = '', updateRunning = false; // one chain of checks at a time (the 3-hourly one skips if it's busy)
+async function checkUpdate() {
+  if (updateRunning) return;
+  updateRunning = true;
+  let fresh = true;
+  try { while (await updateStep(fresh)) { fresh = false; await new Promise(res => setTimeout(res, 10000)); } }
+  finally { updateRunning = false; }
+}
+async function updateStep(fresh) { // true: look again in 10 s (the download is still running)
+  let v; try { v = await (await fetch('/api/version' + (fresh ? '?fresh=1' : ''), { cache: 'no-store' })).json(); } catch { return false; }
+  const failed = !!v.download_failed && !fresh; // a fresh check tries the download again
+  $('sVersion').textContent = 'Version ' + v.version + (v.ready ? ` · ${v.latest} is ready to install` : failed ? ` · ${v.latest} couldn't download` : v.newer ? ` · ${v.latest} is available` : v.latest ? ' · up to date' : '');
   $('sUpdate').hidden = !v.newer;
   $('sUpdate').textContent = v.ready ? 'Update Now' : 'Get Update';
-  if (!v.newer) return;
-  if (!v.ready) { // download it quietly, then look again
+  if (!v.newer) return false;
+  if (!v.ready) { // download it quietly, then look again; stop if the download failed (tried again at the next check)
+    if (failed) return false;
     if (!v.downloading) await post('/api/setup?what=update-download');
-    setTimeout(() => checkUpdate(false), 10000);
-    return;
+    return true;
   }
-  if (updateAsked === v.latest || !$('ask').hidden) return; // once per app start (Later asks again next time)
+  if (updateAsked === v.latest) return false; // once per app start (Later asks again next time)
   updateAsked = v.latest;
   if (await askConfirm({ title: 'Update Ready', text: `CAD Parts ${v.latest} is ready. It installs in a few seconds and reopens by itself.`, ok: 'Update Now', no: 'Later', danger: false })) {
     startUpdate();
   }
+  return false;
 }
-checkUpdate(true);
-setInterval(() => checkUpdate(true), 3 * 3600 * 1000);
+checkUpdate();
+setInterval(checkUpdate, 3 * 3600 * 1000);
 $('sHealth').onclick = () => openChecks();
 // a PC that passed the checks before: check again quietly in the background, and only speak up if something broke
 if (checkedOnStart === false) fetchHealth(false).then(h => { if (h && !coreReady()) { localStorage.removeItem('cad-setup-ok'); openChecks(); } });
@@ -1897,7 +1779,7 @@ $('profMenu').onclick = async e => {
   e.stopPropagation(); // the panel opened below shouldn't see this click as "clicked outside, close"
   $('profMenu').hidden = true; $('bProf').classList.remove('on');
   if (b.dataset.a === 'settings') return openSettings(true);
-  if (b.dataset.a === 'trash') return openTrash();
+  if (b.dataset.a === 'trash') { closePanels(); return openTrash(); }
   if (b.dataset.a === 'folder') return changeSaveLocation();
   if (b.dataset.id) {
     if (b.dataset.id === profId) return;
@@ -1912,12 +1794,11 @@ $('profMenu').onclick = async e => {
   }
 };
 document.addEventListener('click', e => { if (!$('profMenu').hidden && !$('profMenu').contains(e.target) && e.target !== $('bProf')) { $('profMenu').hidden = true; $('bProf').classList.remove('on'); } });
-$('bSet').onclick = e => { e.stopPropagation(); openSettings(); };
 $('setClose').onclick = () => closePanels();
 document.addEventListener('click', e => { if (!$('settings').hidden && !$('settings').contains(e.target)) closePanels(); });
 function closePanels() { // anything open on top? close it and say so
   let any = false;
-  for (const [panel, btn] of [['settings', 'bSet'], ['trash', 'bTrash']]) if (!$(panel).hidden) { $(panel).hidden = true; $(btn).classList.remove('on'); any = true; }
+  for (const panel of ['settings', 'trash']) if (!$(panel).hidden) { $(panel).hidden = true; any = true; }
   if (!$('pmenu').hidden) { $('pmenu').hidden = true; any = true; }
   if (!$('sortMenu').hidden) { $('sortMenu').hidden = true; $('sortBtn').classList.remove('on'); any = true; }
   if (!$('owMenu').hidden) { $('owMenu').hidden = true; any = true; }
@@ -1940,6 +1821,7 @@ function stepPart(d) {
 addEventListener('keydown', e => {
   if (!$('ask').hidden) return; // the "are you sure?" dialog handles its own keys
   if (!$('setup').hidden || !$('checks').hidden) { if (e.key === 'Escape') closePanels(); return; } // a setup card is open: no shortcuts behind it
+  if (!data && e.key !== 'Escape') return; // the parts list hasn't arrived yet
   if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'n') { e.preventDefault(); newPart(); return; }
   if (e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
   if (e.key === 'Escape') {
@@ -1951,7 +1833,9 @@ addEventListener('keydown', e => {
   if (typing()) return;
   const k = e.key;
   if (k === 'n' || k === 'N') newPart();
-  else if (k === 'e' || k === 'E') $('vEdit').click();
+  else if (k === 'e' || k === 'E') { // Edit Part on the list screen, Back to Parts on the chat screen
+    if ($('home').classList.contains('nolist')) setList(true); else if (sel) setList(false);
+  }
   else if (k === 'f' || k === 'F') { if (sel && sel !== NEW) toggleFav(sel); }
   else if (k === 'F2') startRename();
   else if (k === 'd' || k === 'D') duplicatePart();
@@ -1975,7 +1859,8 @@ function renderTrash(items) {
       <span class="tx"><div class="nm" title="${esc(it.from)}">${esc(title)}</div><div class="sb">${esc(sub)} · ${esc(agoIso(it.deleted))}</div></span>
       <button data-i="${i}">Restore</button></div>`;
   }).join('');
-  $('trashList').querySelectorAll('button[data-i]').forEach(b => b.onclick = async () => {
+  $('trashList').querySelectorAll('button[data-i]').forEach(b => b.onclick = async e => {
+    e.stopPropagation(); // the list is redrawn under the click: don't let it count as "clicked outside, close"
     const it = items[+b.dataset.i];
     items.splice(+b.dataset.i, 1); renderTrash(items); // gone from the list right away
     const r = await post(`/api/restore?id=${encodeURIComponent(it.id)}`);
@@ -1985,16 +1870,15 @@ function renderTrash(items) {
 }
 async function openTrash(refresh) {
   const panel = $('trash');
-  if (!refresh && !panel.hidden) { panel.hidden = true; $('bTrash').classList.remove('on'); return; }
-  panel.hidden = false; $('bTrash').classList.add('on');
+  if (!refresh && !panel.hidden) { panel.hidden = true; return; }
+  panel.hidden = false;
   if (!openTrash.items) $('trashList').innerHTML = '<div class="tempty"><div class="ph loading" style="position:static;padding:0"></div></div>';
   else renderTrash(openTrash.items); // show the last list at once, then refresh it
   try { openTrash.items = (await (await fetch('/api/trash', { cache: 'no-store' })).json()).items; } catch { openTrash.items = []; }
   if (!panel.hidden) renderTrash(openTrash.items);
 }
-$('bTrash').onclick = e => { e.stopPropagation(); if ($('trash').hidden) closePanels(); openTrash(); };
-$('trashClose').onclick = () => { $('trash').hidden = true; $('bTrash').classList.remove('on'); };
-document.addEventListener('click', e => { if (!$('trash').hidden && !$('trash').contains(e.target)) { $('trash').hidden = true; $('bTrash').classList.remove('on'); } });
+$('trashClose').onclick = () => { $('trash').hidden = true; };
+document.addEventListener('click', e => { if (!$('trash').hidden && !$('trash').contains(e.target)) $('trash').hidden = true; });
 
 $('bNew').onclick = () => newPart();
 
@@ -2006,10 +1890,8 @@ function renderChats() {
     ? 'Working on ' + (busyKey === 'new' ? 'the new part' : pretty(busyKey.slice(5))) + '…' : '';
 }
 
-localStorage.removeItem('cad-chat-hidden'); localStorage.removeItem('cad-view'); // old settings
 editChat.render(true);
 
-load.fails = 0;
 loadApps();
-load(); setInterval(load, 4000);
+load(); setInterval(() => { if (!load.inflight) load(); }, 4000); // skip a beat while the last one is still out
 setInterval(() => data && renderAll(), 60000); // keep "x min ago" fresh
