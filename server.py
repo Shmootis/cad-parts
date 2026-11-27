@@ -1429,22 +1429,30 @@ def stamp_owner(folder: Path | None = None, name: str = "") -> None:
         pass
 
 
-def sync_roots() -> list[Path]:
-    """Where a parts folder can live: the sync services' folders on this PC (OneDrive, Dropbox, Google Drive,
-    iCloud Drive, Box), plus Documents, Desktop and the home folder."""
-    home, roots = Path.home(), []
+def sync_services() -> list[tuple[str, Path]]:
+    """The sync services' folders on this PC, most common first: (name, folder)."""
+    home, out = Path.home(), []
     for var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
         if os.environ.get(var):
-            roots.append(Path(os.environ[var]))
+            out.append(("OneDrive", Path(os.environ[var])))
     for info in (Path(os.environ.get("APPDATA", "")) / "Dropbox" / "info.json",
                  Path(os.environ.get("LOCALAPPDATA", "")) / "Dropbox" / "info.json"):
         try:
-            roots += [Path(v["path"]) for v in json.loads(info.read_text(encoding="utf-8")).values() if v.get("path")]
+            out += [("Dropbox", Path(v["path"])) for v in json.loads(info.read_text(encoding="utf-8")).values() if v.get("path")]
         except (OSError, ValueError, AttributeError, TypeError):
             pass
-    roots += [home / "Dropbox", home / "Google Drive", home / "My Drive", home / "iCloudDrive", home / "Box"]
+    out += [("Dropbox", home / "Dropbox"), ("Google Drive", home / "Google Drive"), ("Google Drive", home / "My Drive")]
     for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":  # Google Drive for desktop shows up as a drive with "My Drive" in it
-        roots.append(Path(f"{letter}:\\My Drive"))
+        out.append(("Google Drive", Path(f"{letter}:\\My Drive")))
+    out += [("iCloud Drive", home / "iCloudDrive"), ("Box", home / "Box")]
+    return [(n, p) for n, p in out if p.is_dir()]
+
+
+def sync_roots() -> list[Path]:
+    """Where a parts folder can live: the sync services' folders on this PC (OneDrive, Dropbox, Google Drive,
+    iCloud Drive, Box), plus Documents, Desktop and the home folder."""
+    home = Path.home()
+    roots = [p for _, p in sync_services()]
     roots += [_known_folder(5) or home / "Documents", _known_folder(16) or home / "Desktop", home]
     out, seen = [], set()
     for r in roots:
@@ -1495,6 +1503,53 @@ def find_parts_folders(max_dirs: int = 600) -> list[dict]:
                 look(d2)
     _found_cache.update(t=time.time(), v=found)
     return found
+
+
+def suggest_new_folder() -> dict:
+    """Where a brand-new user's parts go: a sync service if this PC has one (so they follow you to a new PC),
+    otherwise Documents. {"folder", "synced": the service's name or ""}."""
+    svc = sync_services()
+    name, base = svc[0] if svc else ("", _known_folder(5) or Path.home() / "Documents")
+    folder = base / "CAD Parts"
+    n = 2
+    while folder.exists() and not (folder / META).is_dir() and any(folder.iterdir()):  # someone else's "CAD Parts"
+        folder = base / f"CAD Parts {n}"; n += 1
+    return {"folder": str(folder), "synced": name, "label": (name or base.name) + "\\" + folder.name}
+
+
+def windows_name() -> str:
+    """The first name of the Windows account, to fill in for the user (they can change it)."""
+    n = ""
+    try:
+        import ctypes
+        size = ctypes.c_ulong(0)
+        ctypes.windll.secur32.GetUserNameExW(3, None, ctypes.byref(size))  # NameDisplay: "Mason Anderson"
+        buf = ctypes.create_unicode_buffer(max(1, size.value))
+        if size.value and ctypes.windll.secur32.GetUserNameExW(3, buf, ctypes.byref(size)):
+            n = buf.value
+    except Exception:  # noqa: BLE001
+        pass
+    n = (n or os.environ.get("USERNAME", "")).strip()
+    if n.lower() in ("wdagutilityaccount", "user", "admin", "administrator", "owner", "defaultuser0", "guest"):
+        return ""
+    n = n.split()[0] if n else ""
+    return n[:1].upper() + n[1:] if n.islower() else n
+
+
+def first_start(force: bool = False) -> dict:
+    """What the first-start screen offers, after signing in to Claude:
+    match: your own parts folder (opens straight away); candidate: a parts folder that isn't tagged with an owner
+    (made before 0.1.9, or copied over), to ask "are these yours?"; suggest + name: for starting fresh."""
+    if force:
+        _found_cache["t"] = 0
+    taken = {os.path.realpath(x["folder"]).lower() for x in load_profiles()["profiles"]}
+    free = [f for f in find_parts_folders() if os.path.realpath(f["folder"]).lower() not in taken]
+    acct = account_id()
+    mine = sorted([f for f in free if acct and f["account"] == acct], key=lambda f: -f["parts"])
+    loose = sorted([f for f in free if not f["account"] and f["parts"]], key=lambda f: -f["parts"])
+    pick = lambda f: {k: f[k] for k in ("folder", "name", "parts")} if f else None
+    return {"match": pick(mine[0] if mine else None), "candidate": pick(loose[0] if loose else None),
+            "suggest": suggest_new_folder(), "name": windows_name()}
 
 
 def find_my_folder() -> dict | None:
@@ -1633,7 +1688,8 @@ def detect_folders() -> dict:
 
 def folder_info(path: str) -> dict:
     f = Path(path)
-    info = {"folder": str(f), "exists": f.is_dir(), "parts": count_parts(f) if f.is_dir() else 0, "printers": [], "printer": ""}
+    info = {"folder": str(f), "exists": f.is_dir(), "parts": count_parts(f) if f.is_dir() else 0, "printers": [], "printer": "",
+            "owner": read_owner(f).get("name", "") if f.is_dir() else ""}
     try:
         st = json.loads((f / META / "state.json").read_text(encoding="utf-8")).get("settings", {})
         info["printers"], info["printer"] = clean_printers(st.get("printers")), st.get("printer") or ""
@@ -2024,7 +2080,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             return self.json(health(force="force" in u.query))
         if u.path == "/api/profile/find":  # first start on a new PC, after signing in
-            return self.json({"match": find_my_folder()})
+            return self.json(first_start(parse_qs(u.query).get("force", [""])[0] == "1"))
         if u.path == "/api/import/peek":
             return self.json(peek_export(parse_qs(u.query).get("file", [""])[0]))
         if u.path == "/api/job":

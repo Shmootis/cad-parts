@@ -1448,15 +1448,85 @@ if (activeProf && !activeProf.exists) {
   $('lostUse').onclick = () => picked && use(picked);
   await new Promise(() => {}); // the rest of the app starts after the reload
 }
-if (!activeProf) {
-  const found = await (await fetch('/api/profile/find', { cache: 'no-store' })).json().catch(() => ({}));
-  const m = found.match;
-  if (m) {
-    const r = await postJSON('/api/profile/save', { id: null, name: m.name || 'Me', folder: m.folder });
-    if (r.ok) { sessionStorage.setItem('cad-welcome', JSON.stringify(m)); location.reload(); await new Promise(() => {}); }
+// ---------- first start on this PC (after install + Claude sign-in), the same for everyone:
+// 1) your parts are here (a sync service) -> open them; 2) parts not tagged with an owner -> "Are these yours?";
+// 3) nothing -> Start Fresh (a synced folder if there is one) / Import a CAD Parts File / My Parts Are Somewhere Else.
+// Printers aren't asked here: Claude asks per part, and they can be added in Settings.
+async function firstStart() {
+  $('start').hidden = false;
+  const show = (title, sub = '') => { $('stTitle').textContent = title; $('stSub').textContent = sub; $('stSub').hidden = !sub; $('stErr').textContent = ''; };
+  const err = t => { $('stErr').textContent = t; };
+  const busy = on => $('start').querySelectorAll('button').forEach(b => b.disabled = on);
+  const plural = n => `${n} part${n === 1 ? '' : 's'}`;
+  const save = async (body, after) => {
+    busy(true);
+    const r = await postJSON('/api/profile/save', { id: null, ...body });
+    busy(false);
+    if (!r.ok) { err('Couldn\'t set that up: ' + (r.error || 'failed')); return false; }
+    if (after) after(r);
+    location.reload(); await new Promise(() => {});
+  };
+  const look = async force => {
+    show('Looking for Your Parts…'); $('stAsk').hidden = $('stNew').hidden = true;
+    return (await fetch('/api/profile/find' + (force ? '?force=1' : ''), { cache: 'no-store' })).json().catch(() => ({}));
+  };
+  let f = await look(false);
+  for (;;) {
+    if (f.match) { // 1) yours: open straight away
+      const m = f.match;
+      await save({ name: m.name || f.name || 'Me', folder: m.folder }, () => sessionStorage.setItem('cad-welcome', JSON.stringify(m)));
+    }
+    if (f.candidate) { // 2) are these yours?
+      const c = f.candidate;
+      show('Are These Your Parts?', `${plural(c.parts)} in ${c.folder}`);
+      $('stAsk').hidden = false;
+      const yes = await new Promise(res => { $('stUse').onclick = () => res(true); $('stNotMine').onclick = () => res(false); });
+      $('stAsk').hidden = true;
+      if (yes) await save({ name: c.name || f.name || 'Me', folder: c.folder }, () => sessionStorage.setItem('cad-welcome', JSON.stringify(c)));
+    }
+    break;
   }
+  // 3) let's get your parts
+  const sug = f.suggest || {};
+  show('Let\'s Get Your Parts', sug.synced ? `New parts go in ${sug.label}, so they follow you to a new PC` : `New parts go in ${sug.label}`);
+  $('stSub').title = sug.folder;
+  $('stNew').hidden = false;
+  $('stName').value = f.name || '';
+  $('stAgain').hidden = false;
+  const needName = () => { const n = $('stName').value.trim(); if (!n) { err('Enter your name.'); $('stName').focus(); } return n; };
+  $('stFresh').onclick = () => { const n = needName(); if (n) save({ name: n, folder: sug.folder }); };
+  $('stImport').onclick = async () => {
+    const file = await pickImportFile(); if (!file) return;
+    const m = await (await fetch('/api/import/peek?file=' + encodeURIComponent(file))).json().catch(() => ({}));
+    if (!m.ok) { err(m.error || 'That isn\'t a CAD Parts file.'); return; }
+    const name = $('stName').value.trim() || m.name; if (!name) { needName(); return; }
+    $('stImport').textContent = 'Importing…';
+    await save({ name, folder: sug.folder, import: file, ...(m.printers.length ? { printers: m.printers, printer: m.printer } : {}) },
+      r => { sessionStorage.setItem('cad-welcome', JSON.stringify({ name, parts: m.parts, imported: true }));
+             if (r.imported && r.imported.skipped.length) sessionStorage.setItem('cad-import-skipped', r.imported.skipped.join(', ')); });
+    $('stImport').textContent = 'Import a CAD Parts File';
+  };
+  $('stElse').onclick = async () => {
+    const folder = await pickFolder(); if (!folder) return;
+    const info = await (await fetch('/api/folderinfo?path=' + encodeURIComponent(folder))).json().catch(() => ({}));
+    const n = $('stName').value.trim() || info.owner || ''; if (!n) { needName(); return; }
+    if (!info.parts && !await askConfirm({ title: 'No parts in that folder', text: 'Keep your new parts there?', ok: 'Use It', danger: false })) return;
+    save({ name: n, folder }, () => { if (info.parts) sessionStorage.setItem('cad-welcome', JSON.stringify({ name: n, parts: info.parts })); });
+  };
+  $('stAgain').onclick = async () => {
+    f = await look(true);
+    if (f.match || f.candidate) return firstStart(); // found them now: start over with what's there
+    show('Still Nothing Here', 'Wait for your sync service to finish, then Look Again');
+    $('stNew').hidden = false;
+  };
+  $('stName').onkeydown = e => { if (e.key === 'Enter') $('stFresh').click(); };
+  setTimeout(() => $('stName').focus(), 0);
 }
-if (!activeProf || !profiles.root) {
+if (!activeProf) {
+  await firstStart();
+  await new Promise(() => {});
+}
+if (!profiles.root) { // a profile, but its folder can't be opened (and the missing-folder screen didn't apply)
   openProfileForm('first', null);
   await new Promise(() => {}); // the rest of the app starts after the reload
 }
@@ -1464,7 +1534,8 @@ profId = activeProf.id;
 document.body.classList.remove('booting');
 { // after "Welcome back" (found your folder) or an import that left some parts out
   const w = sessionStorage.getItem('cad-welcome'); sessionStorage.removeItem('cad-welcome');
-  if (w) { const m = JSON.parse(w); setTimeout(() => toast(`Welcome back${m.name ? ', ' + m.name : ''}: your ${m.parts} part${m.parts === 1 ? ' is' : 's are'} here`), 600); }
+  if (w) { const m = JSON.parse(w); setTimeout(() => toast(m.imported ? `Imported ${m.parts} part${m.parts === 1 ? '' : 's'}`
+      : `Welcome back${m.name ? ', ' + m.name : ''}: your ${m.parts} part${m.parts === 1 ? ' is' : 's are'} here`), 600); }
   const sk = sessionStorage.getItem('cad-import-skipped'); sessionStorage.removeItem('cad-import-skipped');
   if (sk) setTimeout(() => toast('Already in this folder, so not imported: ' + sk), 600);
 }

@@ -148,6 +148,26 @@
     <div class="srow" id="chkDoneRow" hidden><button type="button" id="chkDone" class="primary">Done</button></div>
   </div>
 </div>
+<div id="start" class="setup" hidden>
+  <div class="setupcard">
+    <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round">
+      <path d="M12 2.8 20 7.4v9.2L12 21.2 4 16.6V7.4z"/><path d="M4 7.4 12 12l8-4.6M12 12v9.2" stroke-opacity=".75"/></svg></span>
+    <h1 id="stTitle">Looking for Your Parts…</h1>
+    <p class="sub" id="stSub"></p>
+    <div id="stAsk" class="stbtns" hidden>
+      <button type="button" id="stUse" class="primary">Use These</button>
+      <button type="button" id="stNotMine">No, Something Else</button>
+    </div>
+    <div id="stNew" class="stnew" hidden>
+      <label class="field"><span>Your Name</span><input id="stName" maxlength="40" placeholder="e.g. Alex" autocomplete="off"></label>
+      <button type="button" id="stFresh" class="primary stbig">Start Fresh</button>
+      <button type="button" id="stImport" class="stbig">Import a CAD Parts File</button>
+      <button type="button" id="stElse" class="stbig">My Parts Are Somewhere Else</button>
+      <button type="button" id="stAgain" class="linkbtn">Parts in OneDrive, Dropbox or Google Drive? Sign in to it, then Look Again</button>
+    </div>
+    <div id="stErr" class="perr stc"></div>
+  </div>
+</div>
 <div id="lost" class="setup" hidden>
   <div class="setupcard">
     <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round">

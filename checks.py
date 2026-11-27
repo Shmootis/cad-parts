@@ -145,6 +145,22 @@ def main() -> int:
         check(server.read_owner(root)["name"] == "Tester", "another account doesn't take over the folder")
         server._account["id"] = "test-account"
 
+        # --- first start on a new PC: yours / "are these yours?" / start fresh in a synced folder
+        fake_od = tmp / "FakeOneDrive"
+        (fake_od / "Old Parts" / server.META).mkdir(parents=True)
+        (fake_od / "Old Parts" / "knob").mkdir()
+        (fake_od / "Old Parts" / "knob" / "knob_v1.stl").write_bytes(STL)
+        real_services = server.sync_services
+        server.sync_services = lambda: [("OneDrive", fake_od)]
+        server.sync_roots = lambda: [tmp, fake_od]
+        st = server.first_start(force=True)
+        check(st["match"] and Path(st["match"]["folder"]) == root, "first start: your folder opens straight away", st["match"])
+        check(st["candidate"] and st["candidate"]["folder"].endswith("Old Parts"), "first start: an untagged parts folder is offered", st["candidate"])
+        check(st["suggest"]["synced"] == "OneDrive" and st["suggest"]["label"] == "OneDrive\\CAD Parts", "first start: new parts go in the synced folder", st["suggest"])
+        server.sync_services = lambda: []
+        check(st and server.suggest_new_folder()["synced"] == "" and server.suggest_new_folder()["label"].endswith("\\CAD Parts"), "no sync service: Documents")
+        server.sync_services = real_services
+
         # --- Export My Parts, then import it on "another PC"
         zip_path = tmp / "export.zip"
         r = call("POST", "/api/export?dest=" + urllib.request.quote(str(zip_path)))[1]

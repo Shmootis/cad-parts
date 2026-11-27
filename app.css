@@ -342,6 +342,12 @@ button.danger:hover{background:#3a1d1d;border-color:#8a3a3a}
 .setupcard .mark{align-self:center}
 .setupcard h1,.setupcard .sub{text-align:center}
 #checks .srow,#lost .srow{justify-content:center}
+.stbtns{display:flex;justify-content:center;gap:10px}
+.stnew{display:flex;flex-direction:column;gap:10px;width:min(340px,100%);align-self:center}
+.stnew .field{margin-bottom:4px}
+.stbig{padding:10px 14px;font-size:14px;border-radius:9px}
+.stc{text-align:center;min-height:0}
+#stAgain{font-size:12.5px;margin-top:2px}
 .pfimport{display:flex;justify-content:center;align-items:center;gap:10px;margin:-6px 0 -4px;font-size:13px;color:var(--ink-2)}
 #sExport{white-space:nowrap}
 .linkbtn{background:none;border:none;padding:2px 4px;color:#8fb8ef;font-size:13px;cursor:pointer}
