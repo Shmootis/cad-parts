@@ -330,6 +330,7 @@
     padding:5px 8px;font:inherit;font-size:12px;outline:none}
   .cpaste input:focus{border-color:#3d5878}
   .cpaste button{font-size:12px;padding:4px 10px}
+  .citem .bigbtn{font-size:14px;padding:9px 30px;border-radius:9px}
   .clink{background:none;border:none;padding:0;color:#8fb8ef;font-size:12px;text-decoration:underline;cursor:pointer}
   .citem.busy .ci{background:#1d2733;color:#8fb8ef}
   .citem .ct{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;align-items:center}
@@ -530,11 +531,11 @@
     <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round">
       <path d="M12 2.8 20 7.4v9.2L12 21.2 4 16.6V7.4z"/><path d="M4 7.4 12 12l8-4.6M12 12v9.2" stroke-opacity=".75"/></svg></span>
     <h1 id="chkTitle">Getting CAD Parts Ready</h1>
-    <p class="sub" id="chkSub">CAD Parts needs two free tools on this PC. Setting them up takes a few minutes.</p>
+    <p class="sub" id="chkSub">Installing the tools CAD Parts needs.</p>
     <div id="chkNote" class="cnote" hidden></div>
     <div id="chkList" class="clist"></div>
     <p id="chkEngine" class="cengine" hidden></p>
-    <div class="srow"><button type="button" id="chkDone" class="primary" disabled>Continue</button></div>
+    <div class="srow" id="chkDoneRow" hidden><button type="button" id="chkDone" class="primary">Done</button></div>
   </div>
 </div>
 <div id="toast" class="toast" hidden></div>
@@ -1560,39 +1561,45 @@ const ICON = {
   signin: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8.5" r="3.5"/><path d="M5 20c1.2-3.4 3.8-5 7-5s5.8 1.6 7 5"/></svg>',
 };
 const job = id => ((health && health.jobs) || {})[id] || null;
-// one card per tool: what state it's in, what it says, and the one thing you can do (if any)
-function checkRows() {
-  const cl = chk('claude'), si = chk('signin'), gi = chk('git');
-  const jc = job('claude'), js = job('signin'), jg = job('git');
-  let claude;
-  if (!cl.ok) {
-    claude = jc && jc.state === 'running' ? { state: 'busy', icon: 'install', detail: jc.step || 'Installing…', bar: jc.pct || 0 }
-      : jc && jc.state === 'failed' ? { state: 'todo', icon: 'install', detail: 'Couldn\'t install: ' + jc.error, what: 'claude', label: 'Try again' }
-      : { state: 'busy', icon: 'install', detail: 'Getting ready to install…', bar: 0 };
-  } else if (!si.ok) {
-    claude = js && js.state === 'running' ? { state: 'busy', icon: 'signin', detail: js.step || 'Finish signing in in your browser', paste: true, link: js.url ? 'Open the sign-in page again' : '' }
-      : js && js.state === 'failed' ? { state: 'todo', icon: 'signin', detail: js.error || 'Sign-in didn\'t finish', what: 'signin', label: 'Sign in' }
-      : { state: 'todo', icon: 'signin', detail: 'Needs you to sign in with your Claude account', what: 'signin', label: 'Sign in' };
-  } else claude = { state: 'ok', detail: si.detail ? 'Ready · ' + si.detail : 'Ready' };
-  const git = gi.ok ? { state: 'ok', detail: 'Ready' }
-    : jg && jg.state === 'running' ? { state: 'busy', icon: 'install', detail: jg.step || 'Installing…', bar: jg.pct || 0 }
-    : jg && jg.state === 'failed' ? { state: 'todo', icon: 'install', detail: 'Couldn\'t install: ' + jg.error, what: 'git', label: 'Try again' }
-    : { state: 'busy', icon: 'install', detail: 'Getting ready to install…', bar: 0 };
-  return [{ name: 'Claude Code', ...claude }, { name: 'Git for Windows', ...git }];
+// Two steps, one after the other: 1) install Claude Code and Git (names and bars only), 2) sign in to Claude.
+// Only what needs attention gets a line of text (a failed install, the code box while signing in).
+const installed = () => !!(chk('claude').ok && chk('git').ok);
+let autoClose = false; // first start: once everything's ready, move straight on (no extra click)
+function toolCard(id, name) {
+  const c = chk(id), j = job(id);
+  if (c.ok) return `<div class="citem ok"><span class="ci">${ICON.ok}</span><span class="ct"><b>${name}</b></span></div>`;
+  if (j && j.state === 'failed') return `<div class="citem todo"><span class="ci">${ICON.install}</span>
+    <span class="ct"><b>${name}</b><small title="${esc(j.error || '')}">Couldn't install</small></span>
+    <button type="button" class="primary" data-what="${id}">Try again</button></div>`;
+  return `<div class="citem busy"><span class="ci">${ICON.install}</span><span class="ct"><b>${name}</b></span>
+    <div class="cbar"><i style="width:${Math.round(((j && j.pct) || 0) * 100)}%"></i></div></div>`;
 }
 function renderChecks() {
   if (!health) return;
   const typed = $('chkCode') ? $('chkCode').value : '', typing = document.activeElement && document.activeElement.id === 'chkCode';
   $('chkNote').hidden = true;
-  $('chkList').innerHTML = checkRows().map(r => {
-    const icon = r.state === 'ok' ? ICON.ok : ICON[r.icon];
-    const bar = r.state === 'busy' && r.bar != null ? `<div class="cbar"><i style="width:${Math.round(r.bar * 100)}%"></i></div>` : '';
-    const link = r.link ? `<button type="button" class="clink" data-what="signin-page">${esc(r.link)}</button>` : '';
-    const paste = r.paste ? `<div class="cpaste"><input id="chkCode" placeholder="Got a code? Paste it here" autocomplete="off" spellcheck="false"><button type="button" class="primary" id="chkCodeGo">Finish</button></div>` : '';
-    const btn = r.what ? `<button type="button" class="primary" data-what="${r.what}">${r.label}</button>` : '';
-    return `<div class="citem ${r.state}"><span class="ci">${icon}</span>
-      <span class="ct"><b>${esc(r.name)}</b><small>${esc(r.detail)}</small></span>${bar}${paste}${link}${btn}</div>`;
-  }).join('');
+  const stage = !installed() ? 'install' : !chk('signin').ok ? 'signin' : 'done';
+  const js = job('signin');
+  if (stage === 'install') {
+    $('chkTitle').textContent = 'Getting CAD Parts Ready';
+    $('chkSub').textContent = 'Installing the tools CAD Parts needs.';
+    $('chkList').innerHTML = toolCard('claude', 'Claude Code') + toolCard('git', 'Git for Windows');
+  } else if (stage === 'signin') {
+    $('chkTitle').textContent = 'Sign In to Claude';
+    $('chkSub').textContent = 'CAD Parts uses your own Claude account.';
+    $('chkList').innerHTML = js && js.state === 'running'
+      ? `<div class="citem wide busy"><span class="ci">${ICON.signin}</span><span class="ct"><small>${esc(js.step && js.step !== 'Finish signing in in your browser' ? js.step : 'Finish signing in in your browser')}</small></span>
+          <div class="cpaste"><input id="chkCode" placeholder="Got a code? Paste it here" autocomplete="off" spellcheck="false"><button type="button" class="primary" id="chkCodeGo">Finish</button></div>
+          ${js.url ? '<button type="button" class="clink" data-what="signin-page">Open the sign-in page again</button>' : ''}</div>`
+      : `<div class="citem wide">${js && js.state === 'failed' ? `<span class="ct"><small>${esc(js.error || 'Sign-in didn\'t finish')}</small></span>` : ''}
+          <button type="button" class="primary bigbtn" data-what="signin">Sign in</button></div>`;
+  } else {
+    $('chkTitle').textContent = 'You\'re All Set';
+    $('chkSub').textContent = '';
+    $('chkList').innerHTML = toolCard('claude', 'Claude Code') + toolCard('git', 'Git for Windows');
+  }
+  $('chkSub').hidden = !$('chkSub').textContent;
+  $('chkDoneRow').hidden = stage !== 'done' || autoClose;
   $('chkList').querySelectorAll('button[data-what]').forEach(b => b.onclick = async () => {
     b.disabled = true;
     const r = await post('/api/setup?what=' + encodeURIComponent(b.dataset.what));
@@ -1611,13 +1618,11 @@ function renderChecks() {
     $('chkCodeGo').onclick = send;
     $('chkCode').onkeydown = e => { if (e.key === 'Enter') send(); };
   }
-  const e = chk('build123d');
-  $('chkEngine').hidden = !e.id || e.ok;
-  $('chkEngine').innerHTML = e.busy ? 'Setting up the CAD engine in the background. The first time takes a few minutes.'
-    : e.id && !e.ok ? 'The CAD engine didn\'t start.<button type="button" id="chkEngineRetry">Try again</button>' : '';
+  const e = chk('build123d'); // the CAD engine installs itself; it's only mentioned if it failed
+  $('chkEngine').hidden = !(e.id && !e.ok && !e.busy);
+  $('chkEngine').innerHTML = $('chkEngine').hidden ? '' : 'The CAD engine didn\'t start.<button type="button" id="chkEngineRetry">Try again</button>';
   const retry = $('chkEngineRetry'); if (retry) retry.onclick = async () => { await post('/api/setup?what=build123d'); fetchHealth(true).then(renderChecks); };
-  $('chkTitle').textContent = coreReady() ? 'You\'re All Set' : 'Getting CAD Parts Ready';
-  $('chkDone').disabled = !coreReady(); // both tools are required: no way past this until they're ready
+  if (autoClose && stage === 'done') closeChecks();
 }
 const autoStarted = {};
 async function autoStart() { // Claude Code and Git install as soon as they're found missing: nothing to click
@@ -1635,6 +1640,7 @@ function watchHealth() { // while the setup screen is open it keeps checking by 
 }
 function openChecks() { // resolves when the checklist is closed
   if ($('checks').hidden) closePanels(); // close other panels first
+  autoClose = false;
   $('checks').hidden = false; $('chkNote').hidden = true;
   if (health) renderChecks();
   else $('chkList').innerHTML = '<div class="citem wide"><span class="ct"><b>Checking this PC…</b></span></div>';
@@ -1652,11 +1658,11 @@ $('chkDone').onclick = () => closeChecks();
 let checkedOnStart = false;
 if (localStorage.getItem('cad-setup-ok') !== '1') {
   checkedOnStart = true;
+  autoClose = true;
   $('checks').hidden = false;
   $('chkList').innerHTML = '<div class="citem wide"><span class="ct"><b>Checking this PC…</b></span></div>';
   if (await fetchHealth(true)) {
     if (!coreReady()) { renderChecks(); autoStart(); watchHealth(); await new Promise(res => { checksResolve = res; }); }
-    else { renderChecks(); }
   }
   $('checks').hidden = true; clearInterval(healthPoll);
 }
