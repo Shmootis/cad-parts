@@ -206,10 +206,7 @@ def update_info() -> dict:
         return info
     if _update["v"] is None or time.time() - _update["t"] > 6 * 3600:
         try:
-            req = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
-                                         headers={"Accept": "application/vnd.github+json", "User-Agent": "cad-parts-app"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                rel = json.loads(resp.read().decode("utf-8"))
+            rel = json.loads(http_get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest", timeout=10))
             _update["v"] = {"latest": str(rel.get("tag_name", "")).lstrip("v"), "url": rel.get("html_url")}
         except Exception:  # noqa: BLE001 - offline or rate-limited: just don't show anything
             _update["v"] = {"latest": None, "url": None}
@@ -231,13 +228,78 @@ def _job(what: str, **kw) -> None:
     _jobs.setdefault(what, {"state": "running", "step": "", "pct": None, "error": "", "url": ""}).update(kw)
 
 
-def _install_claude() -> None:
-    """Anthropic's official installer (claude.exe goes to %USERPROFILE%/.local/bin), run hidden."""
-    _job("claude", state="running", step="Installing Claude Code…", pct=None, error="")
+# Downloads go through Windows' own curl.exe: it checks certificates with Windows itself, which on a brand-new PC
+# (or Windows Sandbox) also fetches missing root certificates. Python's own TLS can't, and failed there with
+# "CERTIFICATE_VERIFY_FAILED".
+CURL = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe")
+
+
+def http_get(url: str, timeout: int = 20) -> str:
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-                            "irm https://claude.ai/install.ps1 | iex"], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=1200)
+        r = subprocess.run([CURL, "-fsSL", "--max-time", str(timeout), "-A", "cad-parts-app", url],
+                           capture_output=True, timeout=timeout + 10)
+        if r.returncode == 0:
+            return r.stdout.decode("utf-8", "replace")
+        err = r.stderr.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        err = str(e)
+    raise OSError(err or "download failed")
+
+
+def download(url: str, dest: Path, total: int, what: str, label: str) -> None:
+    """Download with an accurate percentage: curl writes the file, we watch it grow against the known size."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    proc = subprocess.Popen([CURL, "-fsSL", "-A", "cad-parts-app", "-o", str(dest), url],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    while proc.poll() is None:
+        got = dest.stat().st_size if dest.exists() else 0
+        _job(what, step=f"Downloading {label}… {got / 1e6:.0f} of {total / 1e6:.0f} MB" if total else f"Downloading {label}…",
+             pct=min(got / total, 0.999) if total else None)
+        time.sleep(0.3)
+    if proc.returncode != 0:
+        raise OSError((proc.stderr.read() or b"").decode("utf-8", "replace").strip() or "download failed")
+    _job(what, pct=1.0)
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+CLAUDE_RELEASES = "https://downloads.claude.ai/claude-code-releases"
+
+
+def _install_claude() -> None:
+    """The same steps as Anthropic's official installer (claude.ai/install.ps1): latest version → its manifest →
+    download claude.exe → check its SHA-256 against the manifest → `claude.exe install` (puts it in ~/.local/bin).
+    Done here so the download can show real progress and nothing opens a window."""
+    _job("claude", state="running", step="Finding the latest Claude Code…", pct=0.0, error="")
+    try:
+        version = http_get(f"{CLAUDE_RELEASES}/latest").strip()
+        if not re.match(r"^\d+\.\d+\.\d+", version):
+            raise OSError("Claude Code's download service didn't answer (is it available in your region?)")
+        plat = "win32-arm64" if os.environ.get("PROCESSOR_ARCHITECTURE") == "ARM64" else "win32-x64"
+        info = json.loads(http_get(f"{CLAUDE_RELEASES}/{version}/manifest.json"))["platforms"][plat]
+        dest = Path.home() / ".claude" / "downloads" / f"claude-{version}-{plat}.exe"
+        download(f"{CLAUDE_RELEASES}/{version}/{plat}/claude.exe", dest, int(info.get("size") or 0), "claude", "Claude Code")
+        _job("claude", step="Checking the download…")
+        if _sha256(dest) != str(info["checksum"]).lower():
+            dest.unlink()
+            raise OSError("the download didn't match its checksum; try again")
+        _job("claude", step="Installing Claude Code…")
+        r = subprocess.run([str(dest), "install", "latest"], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=600)
+        time.sleep(1)
+        try:
+            dest.unlink()
+        except OSError:
+            pass
         if find_claude():
             _job("claude", state="done", step="Installed")
         else:
@@ -249,26 +311,13 @@ def _install_claude() -> None:
 def _install_git() -> None:
     """Git for Windows' own installer from its GitHub release: downloaded with progress, installed silently for this
     Windows user only (no admin prompt), to %LOCALAPPDATA%/Programs/Git."""
-    _job("git", state="running", step="Finding the latest Git for Windows…", pct=None, error="")
+    _job("git", state="running", step="Finding the latest Git for Windows…", pct=0.0, error="")
     try:
-        req = urllib.request.Request("https://api.github.com/repos/git-for-windows/git/releases/latest",
-                                     headers={"Accept": "application/vnd.github+json", "User-Agent": "cad-parts-app"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            rel = json.loads(resp.read().decode("utf-8"))
+        rel = json.loads(http_get("https://api.github.com/repos/git-for-windows/git/releases/latest"))
         asset = next(a for a in rel.get("assets", []) if re.fullmatch(r"Git-[\d.]+-64-bit\.exe", a.get("name", "")))
         dest = Path(os.environ.get("TEMP", str(Path.home()))) / asset["name"]
-        total = int(asset.get("size") or 0)
-        with urllib.request.urlopen(urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": "cad-parts-app"}),
-                                    timeout=60) as resp, open(dest, "wb") as out:
-            got = 0
-            while True:
-                chunk = resp.read(1 << 18)
-                if not chunk:
-                    break
-                out.write(chunk)
-                got += len(chunk)
-                _job("git", step="Downloading Git for Windows…", pct=round(got / total, 3) if total else None)
-        _job("git", step="Installing Git for Windows…", pct=None)
+        download(asset["browser_download_url"], dest, int(asset.get("size") or 0), "git", "Git for Windows")
+        _job("git", step="Installing Git for Windows…")
         subprocess.run([str(dest), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/SP-", "/CURRENTUSER"],
                        timeout=1200)
         try:
@@ -296,16 +345,19 @@ def _sign_in() -> None:
         proc = subprocess.Popen([exe, "auth", "login"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         _job_procs["signin"] = proc
+        why = ""
         for line in proc.stdout:
             m = re.search(r"https://\S+", line)
             if m and not _jobs["signin"].get("url"):
                 _job("signin", url=m.group(0))
+            if "Couldn't" in line or "couldn't" in line or "error" in line.lower():
+                why = line.split("> ")[-1].strip()[:200]
         proc.wait(timeout=1800)
         _auth_cache["v"] = None
         if claude_auth(force=True).get("loggedIn"):
             _job("signin", state="done", step="Signed in")
         elif _job_procs.get("signin") is proc:  # not replaced by a newer attempt
-            _job("signin", state="failed", error="the sign-in didn't finish")
+            _job("signin", state="failed", error=why or "the sign-in didn't finish")
     except Exception as e:  # noqa: BLE001
         _job("signin", state="failed", error=str(e)[:200])
 
@@ -320,7 +372,24 @@ def _open_signin_page() -> dict:
     return {"ok": False, "error": "no sign-in page to open"}
 
 
-def setup_action(what: str) -> dict:
+def _send_signin_code(code: str) -> dict:
+    """Some sign-ins end on a page that shows a code to paste into Claude Code: the app passes it on."""
+    proc = _job_procs.get("signin")
+    code = re.sub(r"\s+", "", code or "")
+    if not proc or proc.poll() is not None:
+        return {"ok": False, "error": "start the sign-in again"}
+    if not code or len(code) > 2000:
+        return {"ok": False, "error": "paste the code from your browser"}
+    try:
+        proc.stdin.write(code + "\n")
+        proc.stdin.flush()
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    _job("signin", step="Checking the code…")
+    return {"ok": True}
+
+
+def setup_action(what: str, arg: str = "") -> dict:
     """The setup screen's buttons. Everything runs in the background with no windows; progress shows in the app."""
     starters = {"claude": _install_claude, "git": _install_git, "signin": _sign_in}
     if what in starters:
@@ -332,6 +401,8 @@ def setup_action(what: str) -> dict:
         threading.Thread(target=starters[what], daemon=True).start()
     elif what == "signin-page":
         return _open_signin_page()
+    elif what == "signin-code":
+        return _send_signin_code(arg)
     elif what == "build123d":
         threading.Thread(target=warm_worker, daemon=True).start()
     elif what == "update":
@@ -1470,7 +1541,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/profile/remove":
             return self.json(remove_profile(q.get("id", [""])[0]))
         if u.path == "/api/setup":
-            return self.json(setup_action(q.get("what", [""])[0]))
+            return self.json(setup_action(q.get("what", [""])[0], q.get("code", [""])[0]))
         if u.path == "/api/pickfolder":
             return self.json({"path": pick_folder(q.get("start", [""])[0])})
         if ROOT is None and u.path not in ("/api/quit", "/api/chat/stop"):
