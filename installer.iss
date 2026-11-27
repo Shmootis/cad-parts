@@ -56,7 +56,13 @@ Name: "{autoprograms}\CAD Parts"; Filename: "{app}\CAD Parts.exe"
 Name: "{autodesktop}\CAD Parts"; Filename: "{app}\CAD Parts.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\CAD Parts.exe"; Description: "Open CAD Parts"; Flags: nowait postinstall skipifsilent
+; Opened through Explorer, like a double-click: a program started directly by Setup inherits Setup's
+; RedirectionGuard policy, and then uv can't reach its Python (it sits behind a folder junction): os error 448.
+#ifdef TESTRUN
+Filename: "{win}\explorer.exe"; Parameters: """{app}\CAD Parts.exe"""; Description: "Open CAD Parts"; Flags: nowait postinstall
+#else
+Filename: "{win}\explorer.exe"; Parameters: """{app}\CAD Parts.exe"""; Description: "Open CAD Parts"; Flags: nowait postinstall skipifsilent
+#endif
 
 [UninstallDelete]
 ; files the app makes next to itself (the build123d cache and parts live elsewhere)
