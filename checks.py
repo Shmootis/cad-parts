@@ -214,6 +214,37 @@ def main() -> int:
         server.import_parts(str(evil), tmp / "evil-target")
         check(not (tmp / "escaped.txt").exists(), "a file can't write outside the folder")
 
+        # --- updates: a newer release downloads quietly, is checked, and is then "ready" (nothing is installed here)
+        import hashlib
+        fake_setup = tmp / "CAD-Parts-Setup-9.9.9.exe"
+        fake_setup.write_bytes(b"pretend installer")
+        digest = hashlib.sha256(fake_setup.read_bytes()).hexdigest()
+        release = {"tag_name": "v9.9.9", "html_url": "https://example.invalid",
+                   "assets": [{"name": fake_setup.name, "size": fake_setup.stat().st_size,
+                               "browser_download_url": fake_setup.as_uri(), "digest": "sha256:" + digest}]}
+        real_get = server.http_get
+        server.http_get = lambda url, timeout=20: json.dumps(release)
+        server._update["t"] = 0
+        v = call("GET", "/api/version?fresh=1")[1]
+        check(v["newer"] and v["latest"] == "9.9.9" and not v["ready"], "a newer release is noticed", v)
+        call("POST", "/api/setup?what=update-download")
+        for _ in range(40):
+            v = call("GET", "/api/version")[1]
+            if v.get("ready") or (server._jobs.get("update-dl") or {}).get("state") == "failed":
+                break
+            time.sleep(0.25)
+        check(v.get("ready"), "it downloads quietly and is ready", server._jobs.get("update-dl"))
+        release["assets"][0]["digest"] = "sha256:" + "0" * 64
+        server._ready.update(version=None, path=None)
+        try:
+            server._download_update("update-dl")
+            bad = False
+        except OSError:
+            bad = True
+        check(bad and not (server.APP_DATA / "updates" / fake_setup.name).exists(), "a download that doesn't match is thrown away")
+        server.http_get = real_get
+        server._update.update(t=0, v=None)
+
         # --- the installer's /api/quit (no Origin, no key) still stops the server
         check(call("POST", "/api/quit", token=False)[0] == 200, "quit works for the installer")
     finally:

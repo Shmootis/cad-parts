@@ -1797,7 +1797,8 @@ $('sEditProf').onclick = () => openProfileForm('edit', activeProf);
 async function startUpdate() {
   const b = $('sUpdate'); b.disabled = true;
   const r = await post('/api/setup?what=update');
-  if (!r.ok) { b.disabled = false; toast('Couldn\'t update: ' + (r.error || 'failed')); return; }
+  if (r.ok) toast('Updating… CAD Parts will close and reopen by itself', { ms: 20000 });
+  if (!r.ok) { b.disabled = false; toast('Couldn\'t update yet: ' + (r.error || 'failed')); return; }
   for (;;) {
     await new Promise(res => setTimeout(res, 500));
     let v; try { v = await (await fetch('/api/version', { cache: 'no-store' })).json(); } catch { return; } // the installer stopped the server
@@ -1837,17 +1838,29 @@ $('sExport').onclick = async () => {
   b.disabled = false;
 };
 
-// ---------- version + update check (the server asks GitHub for the latest release, at most every 6 hours) ----------
-(async () => {
-  let v; try { v = await (await fetch('/api/version', { cache: 'no-store' })).json(); } catch { return; }
-  $('sVersion').textContent = 'Version ' + v.version + (v.newer ? ` · ${v.latest} is available` : v.latest ? ' · up to date' : '');
+// ---------- updates: checked each time the app opens and every 3 hours while it's open. A new version downloads
+// quietly in the background; once it's ready (and checked), the app asks: Update Now, or Later (asked again next time).
+$('sUpdate').onclick = startUpdate;
+let updateAsked = '';
+async function checkUpdate(fresh) {
+  let v; try { v = await (await fetch('/api/version' + (fresh ? '?fresh=1' : ''), { cache: 'no-store' })).json(); } catch { return; }
+  $('sVersion').textContent = 'Version ' + v.version + (v.ready ? ` · ${v.latest} is ready to install` : v.newer ? ` · ${v.latest} is available` : v.latest ? ' · up to date' : '');
   $('sUpdate').hidden = !v.newer;
-  $('sUpdate').onclick = startUpdate;
-  if (v.newer && localStorage.getItem('cad-update-seen') !== v.latest) { // tell once per new version
-    localStorage.setItem('cad-update-seen', v.latest);
-    toast(`CAD Parts ${v.latest} is available`, { action: 'Get it', ms: 12000, onAction: () => post('/api/setup?what=update') });
+  $('sUpdate').textContent = v.ready ? 'Update Now' : 'Get Update';
+  if (!v.newer) return;
+  if (!v.ready) { // download it quietly, then look again
+    if (!v.downloading) await post('/api/setup?what=update-download');
+    setTimeout(() => checkUpdate(false), 10000);
+    return;
   }
-})();
+  if (updateAsked === v.latest || !$('ask').hidden) return; // once per app start (Later asks again next time)
+  updateAsked = v.latest;
+  if (await askConfirm({ title: 'Update Ready', text: `CAD Parts ${v.latest} is ready. It installs in a few seconds and reopens by itself.`, ok: 'Update Now', no: 'Later', danger: false })) {
+    startUpdate();
+  }
+}
+checkUpdate(true);
+setInterval(() => checkUpdate(true), 3 * 3600 * 1000);
 $('sHealth').onclick = () => openChecks();
 // a PC that passed the checks before: check again quietly in the background, and only speak up if something broke
 if (checkedOnStart === false) fetchHealth(false).then(h => { if (h && !coreReady()) { localStorage.removeItem('cad-setup-ok'); openChecks(); } });

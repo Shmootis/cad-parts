@@ -377,12 +377,14 @@ def _vtuple(v: str):
     return tuple(int(n) for n in re.findall(r"\d+", v)[:3]) or (0,)
 
 
-def update_info() -> dict:
-    """{'version', 'latest', 'url', 'newer'}; asks GitHub at most every 6 hours (nothing about the user is sent)."""
+def update_info(fresh: bool = False) -> dict:
+    """{'version', 'latest', 'url', 'newer', 'ready', 'job'}. Asks GitHub at most every 6 hours, or every 10 minutes
+    when the app asks for a fresh answer (each time its window opens). Nothing about the user is sent."""
     info = {"version": APP_VERSION, "latest": None, "url": None, "newer": False}
     if not UPDATE_REPO:
         return info
-    if _update["v"] is None or time.time() - _update["t"] > 6 * 3600:
+    age = time.time() - _update["t"]
+    if _update["v"] is None or age > 6 * 3600 or (fresh and age > 600):
         try:
             rel = json.loads(http_get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest", timeout=10))
             _update["v"] = {"latest": str(rel.get("tag_name", "")).lstrip("v"), "url": rel.get("html_url")}
@@ -392,6 +394,8 @@ def update_info() -> dict:
     info.update(_update["v"])
     info["newer"] = bool(info["latest"]) and _vtuple(info["latest"]) > _vtuple(APP_VERSION)
     info["job"] = _jobs.get("update")
+    info["ready"] = bool(info["newer"] and _ready["version"] == info["latest"] and _ready["path"] and Path(_ready["path"]).is_file())
+    info["downloading"] = (_jobs.get("update-dl") or {}).get("state") == "running"
     return info
 
 
@@ -402,23 +406,48 @@ def _run_job(what: str, fn) -> None:
         _job(what, state="failed", error=str(e) or "failed")
 
 
-def _install_update() -> None:
-    """Get Update: download the newest installer from the GitHub release, check its SHA-256 (GitHub lists one per
-    file), then hand over to a hidden PowerShell that closes the app window, runs the installer quietly and lets
-    it reopen CAD Parts (installer.iss: /RELAUNCH). The installer stops this server itself."""
-    _job("update", state="running", step="Checking the newest version…", pct=None, error="")
+_ready = {"version": None, "path": None}  # an update that's downloaded and checked, waiting to be installed
+
+
+def _download_update(job: str = "update") -> Path:
+    """Download the newest installer from the GitHub release and check its SHA-256 (GitHub lists one per file).
+    Reuses a copy that's already downloaded and checked."""
     rel = json.loads(http_get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"))
+    latest = str(rel.get("tag_name", "")).lstrip("v")
     asset = next((a for a in rel.get("assets", []) if re.fullmatch(r"CAD-Parts-Setup-[\d.]+\.exe", a.get("name", ""))), None)
     if not asset:
         raise OSError("this release has no installer")
-    dest = APP_DATA / "updates" / asset["name"]
-    download(asset["browser_download_url"], dest, int(asset.get("size") or 0), "update", "the update")
     want = str(asset.get("digest") or "")
     if not want.startswith("sha256:"):
         raise OSError("the release doesn't list a checksum, so the download can't be checked")
-    if _sha256(dest) != want[len("sha256:"):].lower():
-        dest.unlink(missing_ok=True)
-        raise OSError("the download didn't match the release's checksum")
+    want = want[len("sha256:"):].lower()
+    dest = APP_DATA / "updates" / asset["name"]
+    if not (dest.is_file() and _sha256(dest) == want):
+        for old in (APP_DATA / "updates").glob("CAD-Parts-Setup-*.exe"):  # older downloads aren't needed any more
+            old.unlink(missing_ok=True)
+        download(asset["browser_download_url"], dest, int(asset.get("size") or 0), job, "the update")
+        if _sha256(dest) != want:
+            dest.unlink(missing_ok=True)
+            raise OSError("the download didn't match the release's checksum")
+    _ready.update(version=latest, path=str(dest))
+    return dest
+
+
+def _prefetch_update() -> None:
+    """In the background, with no window: get the update ready so the app can say "Update Ready"."""
+    _job("update-dl", state="running", step="", pct=None, error="")
+    _download_update("update-dl")
+    _job("update-dl", state="done", pct=1.0)
+
+
+def _install_update() -> None:
+    """Update Now / Get Update: the checked installer (downloaded now if it isn't yet), then a hidden PowerShell
+    closes the app window, runs the installer quietly and lets it reopen CAD Parts (installer.iss: /RELAUNCH).
+    The installer stops this server itself."""
+    _job("update", state="running", step="Getting the update…", pct=None, error="")
+    info = update_info()
+    ready = info.get("ready")
+    dest = Path(_ready["path"]) if ready else _download_update("update")
     _job("update", step="Installing… CAD Parts will reopen by itself", pct=1.0)
     ps = ("Start-Sleep -Seconds 2; "
           "Get-Process -Name 'CAD Parts' -ErrorAction SilentlyContinue | ForEach-Object { [void]$_.CloseMainWindow() }; "
@@ -623,9 +652,15 @@ def setup_action(what: str, arg: str = "") -> dict:
         return _send_signin_code(arg)
     elif what == "build123d":
         threading.Thread(target=warm_worker, daemon=True).start()
+    elif what == "update-download":  # quietly, in the background
+        if update_info().get("newer") and not update_info().get("ready") and (_jobs.get("update-dl") or {}).get("state") != "running":
+            _jobs.pop("update-dl", None)
+            threading.Thread(target=_run_job, args=("update-dl", _prefetch_update), daemon=True).start()
     elif what == "update":
         if not update_info().get("newer"):
             return {"ok": False, "error": "no update found"}
+        if _chat_lock.locked():
+            return {"ok": False, "error": "wait until Claude has finished building"}
         if (_jobs.get("update") or {}).get("state") != "running":
             _jobs.pop("update", None)
             threading.Thread(target=_run_job, args=("update", _install_update), daemon=True).start()
@@ -2101,7 +2136,7 @@ class Handler(BaseHTTPRequestHandler):
                 x["exists"] = Path(x["folder"]).is_dir()
             return self.json({**d, "root": str(ROOT) if ROOT else None, "detected": detect_folders()})
         if u.path == "/api/version":
-            return self.json(update_info())
+            return self.json(update_info(parse_qs(u.query).get("fresh", [""])[0] == "1"))
         if u.path == "/api/appicon":
             png = app_icon(parse_qs(u.query).get("id", [""])[0])
             if not png:
