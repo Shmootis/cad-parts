@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 
@@ -89,6 +90,169 @@ def find_blender() -> str | None:
         cands += sorted((pf / "Blender Foundation").glob("Blender*/blender.exe"), key=_version_key, reverse=True)
         cands.append(pf / "Steam" / "steamapps" / "common" / "Blender" / "blender.exe")
     return _first(cands)
+
+
+# ---------------------------------------------------------------- "Open with": slicers and 3D apps on this PC
+# Known apps are found in the usual install folders; anything else can be added with "Choose another app…".
+# Choices are per PC (program locations differ between PCs), so they live in %APPDATA%\CAD Parts\apps.json.
+KNOWN_APPS = [  # id, name, kind, install-folder patterns (under Program Files / LocalAppData\Programs)
+    ("bambu", "Bambu Studio", "slicer", ["Bambu Studio/bambu-studio.exe"]),
+    ("orca", "OrcaSlicer", "slicer", ["OrcaSlicer/orca-slicer.exe"]),
+    ("prusa", "PrusaSlicer", "slicer", ["Prusa3D/PrusaSlicer/prusa-slicer.exe", "PrusaSlicer*/prusa-slicer.exe"]),
+    ("cura", "UltiMaker Cura", "slicer", ["UltiMaker Cura*/UltiMaker-Cura.exe", "Ultimaker Cura*/UltiMaker-Cura.exe",
+                                         "Ultimaker Cura*/Cura.exe"]),
+    ("creality", "Creality Print", "slicer", ["Creality/Creality Print*/CrealityPrint.exe", "Creality Print*/CrealityPrint.exe"]),
+    ("lychee", "Lychee Slicer", "slicer", ["Lychee/LycheeSlicer.exe", "Mango3D/Lychee*/LycheeSlicer.exe", "Lychee*/LycheeSlicer.exe"]),
+    ("chitubox", "CHITUBOX", "slicer", ["CHITUBOX/CHITUBOX.exe", "CHITUBOX*/CHITUBOX.exe"]),
+    ("photon", "Photon Workshop", "slicer", ["ANYCUBIC/Photon Workshop*/PhotonWorkshop.exe", "Photon Workshop*/PhotonWorkshop.exe"]),
+    ("blender", "Blender", "modeler", []),  # found by find_blender(); opens through the one-window viewer helper
+    ("freecad", "FreeCAD", "modeler", ["FreeCAD*/bin/FreeCAD.exe"]),
+    ("meshmixer", "Meshmixer", "modeler", ["Autodesk/Meshmixer/meshmixer.exe"]),
+]
+APPS_FILE = APP_DATA / "apps.json"
+
+
+def _find_pattern(patterns) -> str | None:
+    roots = PROGRAM_FILES + [Path(os.environ.get("LOCALAPPDATA", "")) / "Programs"]
+    for pat in patterns:
+        for root in roots:
+            hits = sorted(root.glob(pat), key=_version_key, reverse=True) if root.is_dir() else []
+            if hits:
+                return str(hits[0])
+    return None
+
+
+def _apps_state() -> dict:
+    try:
+        st = json.loads(APPS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st = {}
+    st.setdefault("defaults", {})
+    st.setdefault("custom", [])
+    return st
+
+
+def _save_apps_state(st: dict) -> None:
+    APP_DATA.mkdir(parents=True, exist_ok=True)
+    APPS_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+
+
+def installed_apps() -> list[dict]:
+    out = []
+    for aid, name, kind, pats in KNOWN_APPS:
+        exe = find_blender() if aid == "blender" else _find_pattern(pats)
+        if exe:
+            out.append({"id": aid, "name": name, "kind": kind, "exe": exe})
+    for c in _apps_state()["custom"]:
+        if Path(c.get("exe", "")).is_file():
+            out.append({"id": c["id"], "name": c["name"], "kind": c.get("kind") or "other", "exe": c["exe"], "custom": True})
+    return out
+
+
+def apps_info() -> dict:
+    apps, st = installed_apps(), _apps_state()
+    ids = {a["id"] for a in apps}
+    defaults = {}
+    for kind, prefer in (("slicer", "bambu"), ("modeler", "blender")):
+        want = st["defaults"].get(kind)
+        if want == "none":
+            defaults[kind] = ""
+        elif want in ids:
+            defaults[kind] = want
+        else:  # nothing chosen yet (or it was uninstalled): the usual one if present, else the first found
+            same = [a["id"] for a in apps if a["kind"] == kind]
+            defaults[kind] = prefer if prefer in same else (same[0] if same else "")
+    return {"apps": [{k: v for k, v in a.items() if k != "exe"} for a in apps], "defaults": defaults}
+
+
+def set_default_apps(body: dict) -> dict:
+    st = _apps_state()
+    for kind in ("slicer", "modeler"):
+        if kind in body:
+            st["defaults"][kind] = str(body[kind] or "none")
+    _save_apps_state(st)
+    return {"ok": True, **apps_info()}
+
+
+def open_with(app_id: str, rel: str) -> dict:
+    if app_id == "explorer":
+        return show_in_folder(rel)
+    p = safe_path(rel)
+    if not p or not p.is_file() or p.suffix.lower() not in MODEL_EXT:
+        return {"ok": False, "error": "not a model in your parts folder"}
+    app = next((a for a in installed_apps() if a["id"] == app_id), None)
+    if not app:
+        return {"ok": False, "error": "that app isn't installed any more"}
+    if app_id == "blender":  # one reused Blender window (viewer.py watches a trigger file)
+        if p.suffix.lower() != ".stl":
+            return {"ok": False, "error": "Blender opens STL files"}
+        VIEWER_STATE.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SHOW_PS1),
+                            "-Path", str(p), "-Blender", app["exe"], "-State", str(VIEWER_STATE)],
+                           capture_output=True, text=True, timeout=30)
+        return {"ok": r.returncode == 0, "error": "" if r.returncode == 0 else (r.stderr or r.stdout).strip()[-200:]}
+    # Bambu Studio: its own "single instance" setting decides whether an open window is reused.
+    # Don't pass --single-instance: some builds exit with -2 on it.
+    subprocess.Popen([app["exe"], str(p)], cwd=str(Path(app["exe"]).parent),
+                     creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    return {"ok": True, "name": app["name"]}
+
+
+ICON_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "CAD Parts" / "icons"
+EXPLORER = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "explorer.exe")
+
+
+def app_icon(app_id: str) -> bytes | None:
+    """The app's own icon (taken from its .exe), as a PNG; cached per PC."""
+    if app_id == "explorer":
+        exe = EXPLORER
+    else:
+        app = next((a for a in installed_apps() if a["id"] == app_id), None)
+        exe = app and app["exe"]
+    if not exe or not Path(exe).is_file():
+        return None
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = int(Path(exe).stat().st_mtime)
+    out = ICON_DIR / f"{re.sub(r'[^a-zA-Z0-9_-]', '_', app_id)}-{stamp}.png"
+    if not out.is_file():
+        ps = ("Add-Type -AssemblyName System.Drawing; "
+              f"$i = [System.Drawing.Icon]::ExtractAssociatedIcon({_ps_lit(exe)}); "
+              f"if ($i) {{ $i.ToBitmap().Save({_ps_lit(str(out))}, [System.Drawing.Imaging.ImageFormat]::Png) }}")
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=30)
+    try:
+        return out.read_bytes()
+    except OSError:
+        return None
+
+
+def show_in_folder(rel: str) -> dict:
+    p = safe_path(rel)
+    if not p or not p.exists():
+        return {"ok": False, "error": "not found"}
+    subprocess.Popen([EXPLORER, "/select,", str(p)] if p.is_file() else [EXPLORER, str(p)])
+    return {"ok": True, "name": "File Explorer"}
+
+
+def pick_app() -> dict:
+    """"Choose another app…": Windows' file picker for a program, which is then kept in the Open with list."""
+    ps = ("Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog;"
+          "$f.Title = 'Choose an app to open your parts with'; $f.Filter = 'Programs (*.exe)|*.exe';"
+          "$f.InitialDirectory = $env:ProgramFiles;"
+          "$o = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false};"
+          "if ($f.ShowDialog($o) -eq 'OK') { $f.FileName; (Get-Item -LiteralPath $f.FileName).VersionInfo.ProductName }")
+    r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], capture_output=True, text=True, timeout=600)
+    lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+    if not lines or not lines[0].lower().endswith(".exe"):
+        return {"ok": False, "cancelled": True}
+    exe = lines[0]
+    name = (lines[1] if len(lines) > 1 else "") or Path(exe).stem
+    st = _apps_state()
+    known = next((c for c in st["custom"] if c["exe"].lower() == exe.lower()), None)
+    if not known:
+        known = {"id": f"c{int(time.time() * 1000):x}", "name": name[:40], "exe": exe, "kind": "other"}
+        st["custom"].append(known)
+        _save_apps_state(st)
+    return {"ok": True, "id": known["id"], **apps_info()}
 
 
 def find_bambu() -> str | None:
@@ -213,7 +377,47 @@ def update_info() -> dict:
         _update["t"] = time.time()
     info.update(_update["v"])
     info["newer"] = bool(info["latest"]) and _vtuple(info["latest"]) > _vtuple(APP_VERSION)
+    info["job"] = _jobs.get("update")
     return info
+
+
+def _run_job(what: str, fn) -> None:
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001 - shown in the app instead of crashing the thread
+        _job(what, state="failed", error=str(e) or "failed")
+
+
+def _install_update() -> None:
+    """Get Update: download the newest installer from the GitHub release, check its SHA-256 (GitHub lists one per
+    file), then hand over to a hidden PowerShell that closes the app window, runs the installer quietly and lets
+    it reopen CAD Parts (installer.iss: /RELAUNCH). The installer stops this server itself."""
+    _job("update", state="running", step="Checking the newest version…", pct=None, error="")
+    rel = json.loads(http_get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"))
+    asset = next((a for a in rel.get("assets", []) if re.fullmatch(r"CAD-Parts-Setup-[\d.]+\.exe", a.get("name", ""))), None)
+    if not asset:
+        raise OSError("this release has no installer")
+    dest = APP_DATA / "updates" / asset["name"]
+    download(asset["browser_download_url"], dest, int(asset.get("size") or 0), "update", "the update")
+    want = str(asset.get("digest") or "")
+    if not want.startswith("sha256:"):
+        raise OSError("the release doesn't list a checksum, so the download can't be checked")
+    if _sha256(dest) != want[len("sha256:"):].lower():
+        dest.unlink(missing_ok=True)
+        raise OSError("the download didn't match the release's checksum")
+    _job("update", step="Installing… CAD Parts will reopen by itself", pct=1.0)
+    ps = ("Start-Sleep -Seconds 2; "
+          "Get-Process -Name 'CAD Parts' -ErrorAction SilentlyContinue | ForEach-Object { [void]$_.CloseMainWindow() }; "
+          "$t = 0; while ((Get-Process -Name 'CAD Parts' -ErrorAction SilentlyContinue) -and $t -lt 30) { Start-Sleep -Milliseconds 500; $t++ }; "
+          "Get-Process -Name 'CAD Parts' -ErrorAction SilentlyContinue | Stop-Process -Force; "
+          f"Start-Process -FilePath {_ps_lit(str(dest))} -ArgumentList '/SILENT','/SUPPRESSMSGBOXES','/NORESTART','/RELAUNCH' -Wait")
+    flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    try:  # outlive this server, which the installer stops
+        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                         creationflags=flags | 0x01000000)  # CREATE_BREAKAWAY_FROM_JOB
+    except OSError:
+        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps], creationflags=flags)
+    _job("update", state="done")
 
 
 DOWNLOADS = {"blender": "https://www.blender.org/download/", "bambu": "https://bambulab.com/en/download/studio"}
@@ -406,15 +610,18 @@ def setup_action(what: str, arg: str = "") -> dict:
     elif what == "build123d":
         threading.Thread(target=warm_worker, daemon=True).start()
     elif what == "update":
-        url = update_info().get("url")
-        if not url:
+        if not update_info().get("newer"):
             return {"ok": False, "error": "no update found"}
-        os.startfile(url)
+        if (_jobs.get("update") or {}).get("state") != "running":
+            _jobs.pop("update", None)
+            threading.Thread(target=_run_job, args=("update", _install_update), daemon=True).start()
     elif what in DOWNLOADS:
         os.startfile(DOWNLOADS[what])  # the user's normal browser
     else:
         return {"ok": False, "error": "unknown"}
     return {"ok": True}
+TOKEN = secrets.token_urlsafe(24)  # new every time the server starts; see Handler.blocked
+OPEN_GETS = {"/api/ping", "/api/appicon"}  # harmless, and used where no key can be sent (launcher, <img>)
 SKIP_DIRS = {"ready-to-print", "_sync", "_app", "_to-review"}
 VERSION_RE = re.compile(r"^(?P<series>.+?)_v(?P<n>\d+)(?:_(?P<desc>.*))?$")
 MODEL_EXT = {".stl", ".3mf"}
@@ -475,8 +682,9 @@ CHAT_FILE = "chat.json"  # each part's dashboard conversation, saved (hidden) in
 def scan() -> dict:
     if ROOT is None:
         return {"setup": True}
+    merge_sync_copies()
     st = load_state()
-    complete, favs, tags = set(st["complete"]), set(st["favorites"]), st["tags"]
+    complete, favs, tags, cats = set(st["complete"]), set(st["favorites"]), st["tags"], st["categories"]
     parts = []
     for d in sorted(ROOT.iterdir(), key=lambda x: x.name.lower()):
         if not d.is_dir() or d.name.startswith(".") or d.name in SKIP_DIRS:
@@ -520,14 +728,17 @@ def scan() -> dict:
             "complete": d.name in complete,
             "fav": d.name in favs,
             "tags": tags.get(d.name, []),
+            "category": cats.get(d.name, ""),
             "other": sorted(other),
             "notes": notes,
             **(notes_fields(notes) or printer_from_files(other, models)),
         })
     sig = (str(sum(p["latest"] for p in parts)) + str(sum(p["versions"] for p in parts)) + str(len(parts))
            + "|" + ",".join(sorted(complete)) + "|" + ",".join(sorted(favs))
-           + "|" + json.dumps(tags, sort_keys=True))
-    return {"root": str(ROOT), "parts": parts, "sig": sig, "now": time.time()}
+           + "|" + json.dumps(tags, sort_keys=True) + "|" + json.dumps(cats, sort_keys=True))
+    names = {p["name"] for p in parts}
+    categories = sorted({c for n, c in cats.items() if c and n in names}, key=str.lower)
+    return {"root": str(ROOT), "parts": parts, "categories": categories, "sig": sig, "now": time.time()}
 
 
 NS = "{http://schemas.microsoft.com/3dmanufacturing/core/2015/02}"
@@ -628,6 +839,8 @@ CHAT_PROMPT_BASE = f"""You are running headless inside the user's CAD Parts dash
 - You cannot ask for tool permissions. Only these work: reading/searching files, creating and editing files inside the parts folder (your working directory), and shell commands that start exactly with `{FAST_RUN}` (preferred) or `{UV_PREFIX} python`. Run commands from the parts folder; no `cd`, no `&&`. Anything else is denied. If a task needs more, say so briefly and suggest a regular Claude Code session.
 - Run part scripts with `{FAST_RUN} <part>/<part>_vN.py`. It behaves like `python script.py` but on a warm worker with build123d already loaded (~0.4 s instead of ~11 s), so iterate freely: run, check the printed numbers, fix, and re-run. Have scripts print key dimensions or volumes so you can verify them without extra tools.
 - Follow the project's CLAUDE.md and memory as usual (ask which printer for a new part, one folder per part, notes.md, versioned file names `<part>_vN_<desc>.stl`, STL only).
+- ONE PART = ONE VERSION HISTORY. Every version you save is ONE model file, `<part>_vN_<desc>.stl`, containing ALL the pieces of that part laid out side by side on the build plate (not overlapping, each in its print orientation). Never start a second file series inside a part folder (no `<part>_hook_vN`, `<part>_cup_vN`, …): the app shows each part's versions as one timeline.
+- If the user asks to split a piece off, make something separately, or a piece clearly becomes its own design, create a NEW part folder (`<new-part>/` with `<new-part>_v1_<desc>.py/.stl` and its own notes.md) instead of a new series in the current folder. Name it after the original (e.g. `sanding-holder-cup`) and say its name in your reply; the app files it next to the original automatically.
 - The dashboard does these for you after every reply, so don't do them yourself: show the newest export in its 3D viewer, hide .py and notes.md files, and move older versions to the Recycle Bin (it keeps the newest few, a user setting). Don't open Blender unless asked.
 - Never edit, create or delete anything in the dashboard's own code ({APP_DIR.as_posix()}) or in the `{META}` folder (its settings). If the dashboard seems broken (e.g. a model doesn't appear in the viewer), check that the STL was written, then tell the user plainly what you saw so they can get it fixed in a regular Claude Code session.
 - Each message may start with a [Dashboard: ...] line saying which part and file the user is looking at; "this", "it" etc. usually mean that part.
@@ -688,6 +901,7 @@ def housekeeping() -> list[str]:
     if ROOT is None:
         return []
     keep = load_state()["settings"]["keep"]
+    kept = set(load_state().get("kept", []))  # versions restored from the Recycle Bin stay
     to_recycle = []
     for d in ROOT.iterdir():
         if not d.is_dir() or d.name.startswith(".") or d.name in SKIP_DIRS:
@@ -704,7 +918,7 @@ def housekeeping() -> list[str]:
                     series.setdefault(m["series"], {}).setdefault(int(m["n"]), []).append(f)
         for vers in series.values():
             for n in sorted(vers)[:-keep]:
-                to_recycle += vers[n]
+                to_recycle += [f for f in vers[n] if f"{d.name}/{f.name}" not in kept]
     recycle(to_recycle)
     return [f.name for f in to_recycle if not f.exists()]
 
@@ -742,6 +956,7 @@ def load_state() -> dict:
     st.setdefault("complete", [])
     st.setdefault("favorites", [])
     st.setdefault("tags", {})
+    st.setdefault("categories", {})
     s = st.setdefault("settings", {})
     s.setdefault("model", st.get("model") or "")  # "" = Claude Code's default
     try:
@@ -777,6 +992,38 @@ def update_state(fn) -> dict:
         fn(st)
         save_state(st)
         return st
+
+
+def merge_sync_copies() -> list[str]:
+    """Two PCs on one OneDrive folder: if both changed state.json before syncing, OneDrive keeps both and renames one
+    (state-LAPTOP.json, state (1).json). Fold those copies back in (favorites, kept versions, categories, printers
+    from either PC; this PC's settings win) and send the copy to the Recycle Bin. Returns the merged file names."""
+    if ROOT is None:
+        return []
+    copies = [f for f in (ROOT / META).glob("state*.json") if f.name != "state.json"]
+    if not copies:
+        return []
+    merged = []
+    with _state_lock:
+        st = load_state()
+        for f in copies:
+            try:
+                other = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for key in ("favorites", "complete", "kept"):
+                st[key] = sorted(set(st.get(key, [])) | set(other.get(key) or []))
+            for key in ("categories", "tags"):
+                for k, v in (other.get(key) or {}).items():
+                    st.setdefault(key, {}).setdefault(k, v)
+            names = {x["name"].lower() for x in st["settings"]["printers"]}
+            extra = [x for x in clean_printers((other.get("settings") or {}).get("printers")) if x["name"].lower() not in names]
+            st["settings"]["printers"] = (st["settings"]["printers"] + extra)[:12]
+            merged.append(f)
+        if merged:
+            save_state(st)
+    recycle(merged)
+    return [f.name for f in merged]
 
 
 def _ps_lit(s: str) -> str:
@@ -826,10 +1073,18 @@ if (Test-Path -LiteralPath (Join-Path $from $name)) { 'exists'; exit }
 New-Item -ItemType Directory -Force -Path $from | Out-Null
 $sh.NameSpace($from).MoveHere($it, 0x14)
 Start-Sleep -Milliseconds 400
-if (Test-Path -LiteralPath (Join-Path $from $name)) { 'ok' } else { 'failed' }
+if (Test-Path -LiteralPath (Join-Path $from $name)) { Join-Path $from $name; 'ok' } else { 'failed' }
 """.replace("%ROOT%", _ps_lit(str(ROOT))).replace("%ID%", _ps_lit(item_id))
     r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=60)
-    res = (r.stdout or "").strip().splitlines()[-1:] or ["failed"]
+    lines = (r.stdout or "").strip().splitlines()
+    res = lines[-1:] or ["failed"]
+    if res[0] == "ok" and len(lines) >= 2 and ROOT:  # a version file brought back on purpose: housekeeping keeps it
+        try:
+            rel = Path(lines[-2]).resolve().relative_to(ROOT.resolve())
+            if len(rel.parts) == 2 and rel.suffix.lower() in MODEL_EXT:
+                update_state(lambda st: st.setdefault("kept", []).append(rel.as_posix()))
+        except (ValueError, OSError):
+            pass
     msg = {"ok": None, "gone": "it's no longer in the Recycle Bin", "outside": "not a cad-parts item",
            "exists": "something with that name is already back in its folder", "failed": "Windows couldn't restore it"}
     return {"ok": res[0] == "ok", "error": msg.get(res[0], "Windows couldn't restore it")}
@@ -932,9 +1187,12 @@ def _move_meta(old: str, new: str, copy: bool = False) -> None:
             st["favorites"].append(new)
         if old in st["tags"]:
             st["tags"][new] = list(st["tags"][old])
+        if old in st["categories"]:
+            st["categories"][new] = st["categories"][old]
         if not copy:
             st["favorites"] = [n for n in st["favorites"] if n != old]
             st["tags"].pop(old, None)
+            st["categories"].pop(old, None)
             st["complete"] = [new if n == old else n for n in st["complete"]]
     update_state(fn)
 
@@ -991,6 +1249,30 @@ def duplicate_part(src: str) -> dict:
     return {"ok": True, "name": new}
 
 
+def clean_category(v) -> str:
+    return re.sub(r"\s+", " ", str(v or "")).strip()[:32]
+
+
+def edit_category(body: dict) -> dict:
+    """{"rename": old, "to": new} or {"remove": name}: applies to every part in that category."""
+    def fn(st):
+        cats = st["categories"]
+        if body.get("rename"):
+            old, new = clean_category(body["rename"]), clean_category(body.get("to"))
+            if new:
+                same = next((x for x in cats.values() if x.lower() == new.lower() and x.lower() != old.lower()), None)
+                for k, v in list(cats.items()):
+                    if v.lower() == old.lower():
+                        cats[k] = same or new
+        elif body.get("remove"):
+            gone = clean_category(body["remove"]).lower()
+            for k, v in list(cats.items()):
+                if v.lower() == gone:
+                    cats.pop(k)
+    update_state(fn)
+    return {"ok": True, "sig": scan()["sig"]}
+
+
 def set_meta(name: str, body: dict) -> dict:
     if not part_dir(name):
         return {"ok": False, "error": "unknown part"}
@@ -998,6 +1280,14 @@ def set_meta(name: str, body: dict) -> dict:
     def fn(st):
         if "fav" in body:
             st["favorites"] = [n for n in st["favorites"] if n != name] + ([name] if body["fav"] else [])
+        if "category" in body:
+            c = clean_category(body["category"])
+            if c:
+                # reuse an existing category's spelling when only the capitalisation differs
+                same = next((x for x in st["categories"].values() if x.lower() == c.lower()), None)
+                st["categories"][name] = same or c
+            else:
+                st["categories"].pop(name, None)
         if "tags" in body:
             tags = []
             for t in body["tags"] or []:
@@ -1047,6 +1337,8 @@ STARTER_CLAUDE_MD = """# CAD Parts
 ## Conventions
 - One folder per part, named in lowercase-with-dashes (`phone-stand/`).
 - Versioned files: `<part>_vN_<short-desc>.py` makes `<part>_vN_<short-desc>.stl`. Never overwrite an old version; save the next number.
+- One part = one version history: each version is ONE file with all of the part's pieces laid out side by side. Never start a second file series in a part folder.
+- To split a piece off or make it separately, create a new part folder (named after the original) with its own versions.
 - Keep `<part>/notes.md` up to date: printer, key dimensions, decisions and open questions. Read it when coming back to a part.
 - Export STL only unless asked for something else.
 - Don't model supports: the slicer adds them.
@@ -1285,7 +1577,22 @@ def notify(title: str, body: str) -> None:
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
-def run_chat(handler, message: str, session: str | None, context: str):
+def _file_new_parts(origin: str, new_parts: list[str]) -> str:
+    """Parts split off during a chat about `origin` join origin's category (one named after it if it has none)."""
+    if not origin or not new_parts or not part_dir(origin):
+        return ""
+    st = load_state()
+    cat = st["categories"].get(origin) or " ".join(w.capitalize() for w in re.split(r"[-_\s]+", origin) if w)
+
+    def fn(st):
+        st["categories"].setdefault(origin, cat)
+        for n in new_parts:
+            st["categories"][n] = cat
+    update_state(fn)
+    return cat
+
+
+def run_chat(handler, message: str, session: str | None, context: str, origin: str = ""):
     """Stream one Claude turn to the browser as newline-delimited JSON events."""
     global _chat_proc
 
@@ -1321,6 +1628,7 @@ def run_chat(handler, message: str, session: str | None, context: str):
         if session:
             args += ["--resume", session]
         prompt = (f"[Dashboard: {context}]\n" if context else "") + message
+        parts_before = {d.name for d in ROOT.iterdir() if d.is_dir()}
         bash = find_git_bash()  # Claude Code finds a per-user Git (not on PATH until the next sign-in) through this
         if bash:
             os.environ["CLAUDE_CODE_GIT_BASH_PATH"] = bash
@@ -1364,6 +1672,11 @@ def run_chat(handler, message: str, session: str | None, context: str):
         if proc.returncode:
             err = (proc.stderr.read() or "").strip()[-400:]
             emit({"t": "error", "text": err or "Stopped."})
+        made = sorted(d.name for d in ROOT.iterdir() if d.is_dir() and d.name not in parts_before
+                      and not d.name.startswith((".", "_")) and d.name not in SKIP_DIRS)
+        cat = _file_new_parts(origin, made)
+        if cat:
+            emit({"t": "note", "text": f"Filed {', '.join(made)} in the {cat} category, next to {origin}."})
         recycled = housekeeping()
         if recycled:
             emit({"t": "note", "text": f"Moved to Recycle Bin (keeping the newest {load_state()['settings']['keep']}): " + ", ".join(recycled)})
@@ -1401,10 +1714,38 @@ class Handler(BaseHTTPRequestHandler):
     def json(self, obj, code=200):
         self.send(code, json.dumps(obj).encode(), "application/json")
 
+    # Only this app's own page may use the server. A web page in your browser could otherwise send it requests
+    # (delete parts, start a chat): the Host must be this server (stops DNS rebinding), a browser Origin must be
+    # ours, and API calls carry TOKEN, which only the page we serve knows. /api/quit without an Origin is the
+    # installer / Stop CAD Parts.cmd (local programs, not web pages).
+    def blocked(self, post: bool) -> str | None:
+        port = self.server.server_address[1]
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if (self.headers.get("Host") or "").lower() not in hosts:
+            return "host"
+        origin = self.headers.get("Origin")
+        if origin is not None and origin.lower() not in {"http://" + h for h in hosts}:
+            return "origin"
+        u = urlparse(self.path)
+        needs = post or (u.path.startswith("/api/") and u.path not in OPEN_GETS)
+        if post and u.path == "/api/quit" and origin is None:
+            needs = False
+        if needs:
+            tok = self.headers.get("X-CAD-Token") or parse_qs(u.query).get("t", [""])[0]
+            if not secrets.compare_digest(tok.encode(), TOKEN.encode()):
+                return "token"
+        return None
+
     def do_GET(self):
+        if bad := self.blocked(False):
+            return self.json({"ok": False, "error": "blocked: " + bad}, 403)
         u = urlparse(self.path)
         if u.path in ("/", "/index.html"):
-            return self.send(200, (APP_DIR / "index.html").read_bytes(), "text/html; charset=utf-8")
+            page = (APP_DIR / "index.html").read_bytes().replace(b"__CAD_TOKEN__", TOKEN.encode())
+            return self.send(200, page, "text/html; charset=utf-8")
+        if u.path in ("/app.js", "/app.css"):
+            return self.send(200, (APP_DIR / u.path[1:]).read_bytes(),
+                             ("text/javascript" if u.path.endswith(".js") else "text/css") + "; charset=utf-8")
         if u.path == "/api/ping":
             return self.json({"ok": True})
         if u.path == "/api/parts":
@@ -1443,6 +1784,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({**d, "root": str(ROOT) if ROOT else None, "detected": detect_folders()})
         if u.path == "/api/version":
             return self.json(update_info())
+        if u.path == "/api/appicon":
+            png = app_icon(parse_qs(u.query).get("id", [""])[0])
+            if not png:
+                return self.send(404, b"no icon", "text/plain")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            self.wfile.write(png)
+            return
+        if u.path == "/api/apps":
+            return self.json(apps_info())
         if u.path == "/api/health":
             return self.json(health(force="force" in u.query))
         if u.path == "/api/folderinfo":
@@ -1494,9 +1848,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send(404, b"not found", "text/plain")
 
     def do_POST(self):
+        if bad := self.blocked(True):
+            return self.json({"ok": False, "error": "blocked: " + bad}, 403)
         u = urlparse(self.path)
         q = parse_qs(u.query)
         rel = q.get("path", [""])[0]
+        if u.path == "/api/open":
+            return self.json(open_with(q.get("app", [""])[0], rel))
+        if u.path == "/api/apps/pick":
+            return self.json(pick_app())
+        if u.path == "/api/apps/defaults":
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            except ValueError:
+                return self.json({"ok": False}, 400)
+            return self.json(set_default_apps(body))
         if u.path == "/api/blender":
             p = safe_path(rel)
             if not p or not p.is_file() or p.suffix.lower() != ".stl":
@@ -1550,13 +1916,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(rename_part(rel.strip("/"), q.get("to", [""])[0]))
         if u.path == "/api/duplicate":
             return self.json(duplicate_part(rel.strip("/")))
-        if u.path in ("/api/meta", "/api/settings", "/api/chat/save", "/api/notify"):
+        if u.path in ("/api/meta", "/api/settings", "/api/chat/save", "/api/notify", "/api/category"):
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
             except ValueError:
                 return self.json({"ok": False}, 400)
             if u.path == "/api/meta":
                 return self.json(set_meta(rel.strip("/"), body))
+            if u.path == "/api/category":
+                return self.json(edit_category(body))
             if u.path == "/api/chat/save":
                 return self.json(save_chat(q.get("key", [""])[0], body))
             if u.path == "/api/notify":
@@ -1596,7 +1964,8 @@ class Handler(BaseHTTPRequestHandler):
             msg = str(body.get("message", "")).strip()
             if not msg:
                 return self.json({"ok": False, "error": "empty message"}, 400)
-            return run_chat(self, msg, body.get("session") or None, str(body.get("context", ""))[:300])
+            return run_chat(self, msg, body.get("session") or None, str(body.get("context", ""))[:300],
+                            str(body.get("part") or "")[:80])
         if u.path == "/api/chat/stop":
             p = _chat_proc
             if p and p.poll() is None:

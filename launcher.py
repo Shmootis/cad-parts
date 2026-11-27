@@ -86,12 +86,25 @@ def wait_for_server(seconds=60):
 
 
 class Api:
-    """Called from the page (window.pywebview.api) when the server isn't answering."""
+    """Called from the page (window.pywebview.api)."""
+
+    _win = None  # the app window (set in main); underscore: not exposed to the page
 
     def start_server(self):
+        """When the server isn't answering."""
         if not server_up():
             start_server()
         return wait_for_server(60)
+
+    def pick_folder(self, start=""):
+        """Windows' folder picker, shown by the app window itself: opens at once and always in front of it."""
+        import webview
+        if not self._win:
+            return None
+        kind = webview.FileDialog.FOLDER if hasattr(webview, "FileDialog") else webview.FOLDER_DIALOG
+        start = start if start and os.path.isdir(start) else ""
+        r = self._win.create_file_dialog(kind, directory=start)
+        return r[0] if r else None
 
 
 def focus_existing():
@@ -175,9 +188,11 @@ def main():
                 return
         win.load_url(URL)
 
+    api = Api()
     win = webview.create_window(TITLE, html=LOADING, width=g["width"], height=g["height"], **pos,
                                 min_size=(1000, 650), maximized=g["maximized"], background_color="#121211",
-                                js_api=Api())
+                                js_api=api)
+    api._win = win
 
     # remember the last normal (not maximized) size and position, and whether it was maximized
     def on_resized(w, h):

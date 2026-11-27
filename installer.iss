@@ -41,6 +41,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "CAD Parts.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "server.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "index.html"; DestDir: "{app}"; Flags: ignoreversion
+Source: "app.js"; DestDir: "{app}"; Flags: ignoreversion
+Source: "app.css"; DestDir: "{app}"; Flags: ignoreversion
 Source: "run.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "cadworker.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "selftest.py"; DestDir: "{app}"; Flags: ignoreversion
@@ -63,6 +65,8 @@ Filename: "{win}\explorer.exe"; Parameters: """{app}\CAD Parts.exe"""; Descripti
 #else
 Filename: "{win}\explorer.exe"; Parameters: """{app}\CAD Parts.exe"""; Description: "Open CAD Parts"; Flags: nowait postinstall skipifsilent
 #endif
+; an update started from the app (Settings > Get Update) runs silently with /RELAUNCH: reopen the app afterwards
+Filename: "{win}\explorer.exe"; Parameters: """{app}\CAD Parts.exe"""; Flags: nowait; Check: Relaunch
 
 [UninstallDelete]
 ; files the app makes next to itself (the build123d cache and parts live elsewhere)
@@ -80,6 +84,11 @@ begin
     '-NoProfile -WindowStyle Hidden -Command "try { Invoke-RestMethod -Method Post -TimeoutSec 5 http://127.0.0.1:8765/api/quit | Out-Null } catch {}; ' +
     'Get-NetTCPConnection -LocalPort 8766 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }"',
     '', SW_HIDE, ewWaitUntilTerminated, Rc);
+end;
+
+function Relaunch(): Boolean;
+begin
+  Result := WizardSilent and (Pos('/RELAUNCH', Uppercase(GetCmdTail)) > 0);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
