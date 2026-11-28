@@ -2208,58 +2208,27 @@ def run_chat(handler, message: str, session: str | None, context: str, origin: s
         model = load_state()["settings"]["model"]  # Settings panel; empty = Claude Code's default
         if model:
             args += ["--model", model]
-        if session:
-            args += ["--resume", session]
         prompt = (f"[Dashboard: {context}]\n" if context else "") + message
         parts_before = {d.name for d in ROOT.iterdir() if d.is_dir()}
         bash = find_git_bash()  # Claude Code finds a per-user Git (not on PATH until the next sign-in) through this
         if bash:
             os.environ["CLAUDE_CODE_GIT_BASH_PATH"] = bash
-        try:
-            proc = subprocess.Popen(args, cwd=str(ROOT), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
-        except OSError:
-            emit({"t": "error", "text": "Couldn't start the claude command on this PC."})
+        proc, errs, held = _start_turn(args + (["--resume", session] if session else []), prompt, emit,
+                                       hold_errors=bool(session))
+        if proc is None:
             return
-        _chat_proc = proc
-        errs: list[str] = []  # read alongside stdout: a full stderr pipe would otherwise stall Claude forever
-        err_reader = threading.Thread(target=lambda: errs.append(proc.stderr.read() or ""), daemon=True)
-        err_reader.start()
-        try:
-            proc.stdin.write(prompt)
-            proc.stdin.close()
-        except OSError:  # it exited straight away; its stderr says why
-            pass
-        for line in proc.stdout:
-            try:
-                ev = json.loads(line)
-            except ValueError:
-                continue
-            typ = ev.get("type")
-            if typ == "system" and ev.get("subtype") == "init":
-                emit({"t": "session", "id": ev.get("session_id")})
-            elif typ == "assistant":
-                for c in ev.get("message", {}).get("content", []):
-                    if c.get("type") == "text" and c.get("text", "").strip():
-                        text = c["text"]
-                        if BUILD_MARK in text:  # Claude has committed to modelling: start the viewer's build animation
-                            emit({"t": "building"})
-                            text = text.replace(BUILD_MARK, "").strip()
-                        if text:
-                            emit({"t": "text", "text": text})
-                    elif c.get("type") == "tool_use":
-                        emit({"t": "tool", "text": _tool_summary(c.get("name", ""), c.get("input") or {})})
-            elif typ == "result":
-                denied = [_tool_summary(d.get("tool_name", ""), d.get("tool_input") or {})
-                          for d in ev.get("permission_denials") or []]
-                if denied:
-                    emit({"t": "denied", "items": denied})
-                if ev.get("is_error"):
-                    emit({"t": "error", "text": str(ev.get("result") or ev.get("subtype") or "Claude stopped with an error.")})
-                emit({"t": "session", "id": ev.get("session_id")})
-        proc.wait()
+        if held is not None:  # we were resuming: did that fail only because this PC doesn't have the conversation?
+            if proc.returncode and _NO_CONVO in "".join(errs) + "".join(held):
+                # Chats sync through OneDrive but Claude's conversation is kept per PC (and per user folder),
+                # so a chat started on the other PC can't be resumed here. Start fresh, with the saved chat.
+                emit({"t": "note", "text": "This chat started on another PC, so Claude is carrying on from the saved chat."})
+                proc, errs, _ = _start_turn(args, _chat_history(origin, message) + prompt, emit)
+                if proc is None:
+                    return
+            else:
+                for text in held:
+                    emit({"t": "error", "text": text})
         if proc.returncode and not gone:
-            err_reader.join(timeout=2)
             emit({"t": "error", "text": "".join(errs).strip()[-400:] or "Stopped."})
         try:  # whatever Claude managed to make is tidied up, even if the page has gone
             made = sorted(d.name for d in ROOT.iterdir() if d.is_dir() and d.name not in parts_before
@@ -2280,6 +2249,91 @@ def run_chat(handler, message: str, session: str | None, context: str, origin: s
         _chat_proc = None
         _chat_lock.release()
         emit({"t": "done"})
+
+
+_NO_CONVO = "No conversation found"
+
+
+def _chat_history(origin: str, message: str, limit: int = 12000) -> str:
+    """The saved chat (what you and Claude said, not tool lines) as text, for a fresh conversation."""
+    p = chat_path("part:" + origin if origin else "new")
+    try:
+        msgs = json.loads(p.read_text(encoding="utf-8")).get("msgs", []) if p and p.is_file() else []
+    except (OSError, ValueError):
+        msgs = []
+    lines = []
+    for m in msgs:
+        who = {"user": "User", "claude": "Claude"}.get(m.get("role"))
+        text = str(m.get("text") or "").strip()
+        if who and text:
+            lines.append(f"{who}: {text}")
+    if lines and lines[-1] == f"User: {message.strip()}":  # the message being sent is already saved
+        lines.pop()
+    body = "\n\n".join(lines)
+    if not body:
+        return ""
+    if len(body) > limit:
+        body = "…" + body[-limit:]
+    return ("[Earlier in this chat (it started on another PC, so only the saved text is here; "
+            "check the part's files and notes.md for what was actually done):]\n" + body + "\n[End of earlier chat]\n\n")
+
+
+def _start_turn(args: list, prompt: str, emit, hold_errors: bool = False):
+    """Run one claude process and stream its events. Returns (proc, stderr parts, held errors).
+    With hold_errors, error results are returned instead of shown, so the caller can decide (resume failures)."""
+    global _chat_proc
+    try:
+        proc = subprocess.Popen(args, cwd=str(ROOT), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    except OSError:
+        emit({"t": "error", "text": "Couldn't start the claude command on this PC."})
+        return None, [], None
+    _chat_proc = proc
+    errs: list[str] = []  # read alongside stdout: a full stderr pipe would otherwise stall Claude forever
+    err_reader = threading.Thread(target=lambda: errs.append(proc.stderr.read() or ""), daemon=True)
+    err_reader.start()
+    held: list[str] | None = [] if hold_errors else None
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except OSError:  # it exited straight away; its stderr says why
+        pass
+    for line in proc.stdout:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        typ = ev.get("type")
+        if typ == "system" and ev.get("subtype") == "init":
+            emit({"t": "session", "id": ev.get("session_id")})
+        elif typ == "assistant":
+            for c in ev.get("message", {}).get("content", []):
+                if c.get("type") == "text" and c.get("text", "").strip():
+                    text = c["text"]
+                    if BUILD_MARK in text:  # Claude has committed to modelling: start the viewer's build animation
+                        emit({"t": "building"})
+                        text = text.replace(BUILD_MARK, "").strip()
+                    if text:
+                        emit({"t": "text", "text": text})
+                elif c.get("type") == "tool_use":
+                    emit({"t": "tool", "text": _tool_summary(c.get("name", ""), c.get("input") or {})})
+        elif typ == "result":
+            denied = [_tool_summary(d.get("tool_name", ""), d.get("tool_input") or {})
+                      for d in ev.get("permission_denials") or []]
+            if denied:
+                emit({"t": "denied", "items": denied})
+            if ev.get("is_error"):
+                text = str(ev.get("result") or ev.get("subtype") or "Claude stopped with an error.")
+                if held is not None:
+                    held.append(text)
+                else:
+                    emit({"t": "error", "text": text})
+            if ev.get("session_id") and not (held is not None and ev.get("is_error")):
+                emit({"t": "session", "id": ev.get("session_id")})
+    proc.wait()
+    if proc.returncode:
+        err_reader.join(timeout=2)
+    return proc, errs, held
 
 
 def _kill_tree(p: subprocess.Popen) -> None:
