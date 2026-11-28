@@ -1711,13 +1711,15 @@ $('sExport').onclick = async () => {
   b.disabled = false;
 };
 
-// ---------- updates: checked each time the app opens and every 3 hours while it's open. A new version downloads
-// quietly in the background; once it's ready (and checked), the app asks: Update Now, or Later (asked again next time).
+// ---------- updates: checked (with GitHub, never an old answer) when the app opens, whenever you come back to its
+// window, and every 15 minutes while it's open, so a new release shows up straight away. It downloads quietly in the
+// background; once it's ready (and checked), the app asks: Update Now, or Later (asked again next time).
 $('sUpdate').onclick = startUpdate;
-let updateAsked = '', updateRunning = false; // one chain of checks at a time (the 3-hourly one skips if it's busy)
+let updateAsked = '', updateRunning = false, updateCheckedAt = 0; // one chain of checks at a time
 async function checkUpdate() {
   if (updateRunning) return;
   updateRunning = true;
+  updateCheckedAt = Date.now();
   let fresh = true;
   try { while (await updateStep(fresh)) { fresh = false; await new Promise(res => setTimeout(res, 10000)); } }
   finally { updateRunning = false; }
@@ -1742,7 +1744,11 @@ async function updateStep(fresh) { // true: look again in 10 s (the download is 
   return false;
 }
 checkUpdate();
-setInterval(checkUpdate, 3 * 3600 * 1000);
+setInterval(checkUpdate, 15 * 60 * 1000);
+// back to the window: look again (at most every 2 minutes, which keeps well inside GitHub's 60 checks an hour)
+const updateOnReturn = () => { if (!document.hidden && Date.now() - updateCheckedAt > 2 * 60 * 1000) checkUpdate(); };
+window.addEventListener('focus', updateOnReturn);
+document.addEventListener('visibilitychange', updateOnReturn);
 $('sHealth').onclick = () => openChecks();
 // a PC that passed the checks before: check again quietly in the background, and only speak up if something broke
 if (checkedOnStart === false) fetchHealth(false).then(h => { if (h && !coreReady()) { localStorage.removeItem('cad-setup-ok'); openChecks(); } });

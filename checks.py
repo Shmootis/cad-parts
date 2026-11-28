@@ -294,10 +294,11 @@ def main() -> int:
                    "assets": [{"name": fake_setup.name, "size": fake_setup.stat().st_size,
                                "browser_download_url": fake_setup.as_uri(), "digest": "sha256:" + digest}]}
         real_get = server.http_get
+        # the app asked a minute ago (no update then); the release goes up; the next fresh check must see it
+        server._update.update(t=time.time() - 60, v={"latest": server.APP_VERSION, "url": None})
         server.http_get = lambda url, timeout=20: json.dumps(release)
-        server._update["t"] = 0
         v = call("GET", "/api/version?fresh=1")[1]
-        check(v["newer"] and v["latest"] == "9.9.9" and not v["ready"], "a newer release is noticed", v)
+        check(v["newer"] and v["latest"] == "9.9.9" and not v["ready"], "a new release is noticed straight away", v)
         call("POST", "/api/setup?what=update-download")
         for _ in range(40):
             v = call("GET", "/api/version")[1]

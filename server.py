@@ -412,14 +412,15 @@ def _vtuple(v: str):
 
 def update_info(fresh: bool = False) -> dict:
     """{'version', 'latest', 'url', 'newer', 'job', 'ready', 'downloading', 'download_failed'} (always all of them).
-    Asks GitHub at most every 6 hours, or every 10 minutes when the app asks for a fresh answer (each time its
-    window opens). Nothing about the user is sent."""
+    A fresh answer (the app opening or coming back to the front, its regular check, Get Update) always asks GitHub,
+    so a new release shows up straight away; only calls within a few seconds of each other share one answer.
+    Other callers reuse the last answer for up to 15 minutes. Nothing about the user is sent."""
     info = {"version": APP_VERSION, "latest": None, "url": None, "newer": False,
             "job": None, "ready": False, "downloading": False, "download_failed": False}
     if not UPDATE_REPO:
         return info
     age = time.time() - _update["t"]
-    if _update["v"] is None or age > 6 * 3600 or (fresh and age > 600):
+    if _update["v"] is None or age > 900 or (fresh and age > 5):
         try:
             rel = json.loads(http_get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest", timeout=10))
             _update["v"] = {"latest": str(rel.get("tag_name", "")).lstrip("v"), "url": rel.get("html_url")}
@@ -702,7 +703,7 @@ def setup_action(what: str, arg: str = "") -> dict:
             _jobs.pop("update-dl", None)
             threading.Thread(target=_run_job, args=("update-dl", _prefetch_update), daemon=True).start()
     elif what == "update":
-        if not update_info().get("newer"):
+        if not update_info(fresh=True).get("newer"):  # Get Update asks GitHub now, never an old answer
             return {"ok": False, "error": "no update found"}
         if _chat_lock.locked():
             return {"ok": False, "error": "wait until Claude has finished building"}
